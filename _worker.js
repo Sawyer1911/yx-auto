@@ -329,7 +329,7 @@ function generateLinksFromSource(list, user, workerDomain, disableNonTLS = false
 async function generateTrojanLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/', echConfig = null) {
     const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
     const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
+    const defaultHttpsPorts = [2087];
     const defaultHttpPorts = disableNonTLS ? [] : [80];
     const links = [];
     const wsPath = customPath || '/';
@@ -399,7 +399,7 @@ async function generateTrojanLinksFromSource(list, user, workerDomain, disableNo
 function generateVMessLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/', echConfig = null) {
     const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
     const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
+    const defaultHttpsPorts = [8443];
     const defaultHttpPorts = disableNonTLS ? [] : [80];
     const links = [];
     const wsPath = customPath || '/';
