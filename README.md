@@ -12,6 +12,8 @@ GitHub: https://github.com/byJoey/yx-auto
 - 多协议支持：VLESS、Trojan、VMess
 - 多客户端格式：Clash、Surge、Quantumult X等
 - 运营商筛选：可以按移动/联通/电信筛选
+- 在原作者的基础上，利用添加了一些我需要的功能，例如根据订阅链接替换优选节点
+- 添加了自适应的订阅链接
 
 ## 部署
 
