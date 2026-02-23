@@ -432,27 +432,85 @@ function batchReplaceNodeIPs(originalNodes, ipList, maxIPs = 30) {
 // ============================================================
 // 处理节点IP替换订阅请求（新增端点）
 // ============================================================
+// 从URL拉取节点列表
+async function fetchNodesFromURL(nodeUrl) {
+    if (!nodeUrl || !nodeUrl.trim()) return [];
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const response = await fetch(nodeUrl.trim(), {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) return [];
+        const text = await response.text();
+        // 尝试base64解码（订阅格式）
+        let decoded = text.trim();
+        try {
+            const b64decoded = atob(decoded.replace(/\s/g, ''));
+            if (b64decoded.includes('://')) decoded = b64decoded;
+        } catch (e) { /* 非base64，直接按行解析 */ }
+        return decoded.split('\n').map(l => l.trim()).filter(l =>
+            l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://')
+        );
+    } catch (e) {
+        return [];
+    }
+}
+
+// TLS过滤：如果开启仅TLS，过滤掉非TLS的重建节点
+function filterNodesByTLS(nodes, disableNonTLS) {
+    if (!disableNonTLS) return nodes;
+    return nodes.filter(link => {
+        if (link.startsWith('vmess://')) {
+            try {
+                const b64 = link.substring(8);
+                let jsonStr = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+                try { jsonStr = decodeURIComponent(jsonStr.split('').map(c => '%' + c.charCodeAt(0).toString(16).padStart(2,'0')).join('')); } catch(e){}
+                const cfg = JSON.parse(jsonStr);
+                return cfg.tls === 'tls';
+            } catch (e) { return true; }
+        }
+        return link.includes('security=tls') || link.includes('security%3Dtls');
+    });
+}
+
 async function handleReplaceIPSubscription(request, uuid, nodesB64, ipSources, maxIPs = 30) {
     const url = new URL(request.url);
     const target = url.searchParams.get('target') || 'base64';
-    
-    // 解码原始节点
+    const disableNonTLS = url.searchParams.get('dkby') === 'yes';
+    const useEpd = url.searchParams.get('epd') !== 'no';
+
+    // 解码原始节点（nodesB64可为null，则从nodeUrl拉取）
     let originalNodes = [];
-    try {
-        const decoded = atob(nodesB64);
-        originalNodes = decoded.split('\n').map(l => l.trim()).filter(l => l);
-    } catch (e) {
-        return new Response('节点数据解码失败', { status: 400 });
+    if (nodesB64) {
+        try {
+            const decoded = atob(nodesB64);
+            originalNodes = decoded.split('\n').map(l => l.trim()).filter(l => l &&
+                (l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://'))
+            );
+        } catch (e) {
+            return new Response('节点数据解码失败', { status: 400 });
+        }
     }
     
+    // 从URL拉取节点
+    const nodeUrlParam = url.searchParams.get('nodeUrl');
+    if (nodeUrlParam) {
+        const fetched = await fetchNodesFromURL(nodeUrlParam);
+        originalNodes.push(...fetched);
+    }
+
+    // 去重
+    originalNodes = [...new Set(originalNodes)];
+
     if (originalNodes.length === 0) {
         return new Response('没有有效的节点数据', { status: 400 });
     }
     
     // 获取优选IP列表
     let ipList = [];
-    
-    // 来源1：wetest动态IP
     const ipv4Enabled = url.searchParams.get('ipv4') !== 'no';
     const ipv6Enabled = url.searchParams.get('ipv6') !== 'no';
     const ispMobile = url.searchParams.get('ispMobile') !== 'no';
@@ -464,29 +522,45 @@ async function handleReplaceIPSubscription(request, uuid, nodesB64, ipSources, m
         const wetestIPs = await fetchDynamicIPs(ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom);
         ipList.push(...wetestIPs);
     }
-    
-    // 来源2：自定义URL列表
     if (ipSources && ipSources.length > 0) {
         const urlIPs = await fetchMultipleURLIPs(ipSources, maxIPs);
         ipList.push(...urlIPs);
     }
-    
-    // 默认IP来源
     if (ipList.length === 0) {
         const defaultIPs = await fetchAndParseNewIPs(defaultIPURL);
         ipList.push(...defaultIPs);
     }
-    
-    // 限制数量
     ipList = ipList.slice(0, maxIPs);
-    
+
     if (ipList.length === 0) {
         return new Response('无法获取优选IP列表', { status: 500 });
     }
-    
-    // 批量替换
-    const replacedLinks = batchReplaceNodeIPs(originalNodes, ipList, maxIPs);
-    
+
+    // 批量IP替换
+    let replacedLinks = batchReplaceNodeIPs(originalNodes, ipList, maxIPs);
+
+    // 优选域名替换（共用）：将每个原始节点的host替换为各优选域名
+    if (useEpd) {
+        const domainUrlsStr = url.searchParams.get('domainUrls');
+        let domainHostList = [...directDomains.map(d => d.domain || d.name)];
+        if (domainUrlsStr) {
+            const domainUrls = domainUrlsStr.split(',').map(u => u.trim()).filter(u => u.startsWith('http'));
+            for (const du of domainUrls) {
+                try {
+                    const extras = await fetchCustomDomains(du);
+                    domainHostList.push(...extras.map(d => d.ip));
+                } catch(e) {}
+            }
+        }
+        // 用域名列表做替换（域名作为IP项）
+        const domainItems = domainHostList.map(d => ({ ip: d, port: 443, name: d, isp: d }));
+        const domainLinks = batchReplaceNodeIPs(originalNodes, domainItems, domainItems.length);
+        replacedLinks.push(...domainLinks);
+    }
+
+    // TLS过滤
+    replacedLinks = filterNodesByTLS(replacedLinks, disableNonTLS);
+
     if (replacedLinks.length === 0) {
         return new Response('节点替换失败，请检查节点格式', { status: 500 });
     }
@@ -998,7 +1072,8 @@ function generateQuantumultConfig(links) {
     return btoa(links.join('\n'));
 }
 
-// 生成主页（增强版，含三个新功能UI）
+
+// 生成主页（统一卡片版）
 function generateHomePage(scuValue) {
     const scu = scuValue || 'https://url.v1.mk/sub';
     return `<!DOCTYPE html>
@@ -1010,1098 +1085,676 @@ function generateHomePage(scuValue) {
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>服务器优选工具</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            -webkit-tap-highlight-color: transparent;
-        }
-        
+        * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif;
             background: linear-gradient(180deg, #f5f5f7 0%, #ffffff 50%, #fafafa 100%);
-            color: #1d1d1f;
-            min-height: 100vh;
+            color: #1d1d1f; min-height:100vh; overflow-x:hidden;
             padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-            overflow-x: hidden;
         }
-        
-        .container {
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .header {
-            text-align: center;
-            padding: 48px 20px 32px;
-        }
-        
-        .header h1 {
-            font-size: 40px;
-            font-weight: 700;
-            letter-spacing: -0.3px;
-            color: #1d1d1f;
-            margin-bottom: 8px;
-            line-height: 1.1;
-        }
-        
-        .header p {
-            font-size: 17px;
-            color: #86868b;
-            font-weight: 400;
-            line-height: 1.5;
-        }
-
+        .container { max-width:620px; margin:0 auto; padding:20px; }
+        .header { text-align:center; padding:44px 20px 28px; }
+        .header h1 { font-size:38px; font-weight:700; letter-spacing:-0.3px; color:#1d1d1f; margin-bottom:8px; }
+        .header p { font-size:16px; color:#86868b; }
         .section-title {
-            font-size: 13px;
-            font-weight: 700;
-            color: #007AFF;
-            text-transform: uppercase;
-            letter-spacing: 0.8px;
-            padding: 0 4px 8px;
+            font-size:12px; font-weight:700; color:#86868b; text-transform:uppercase;
+            letter-spacing:0.8px; padding:0 4px 8px; margin-top:4px;
         }
-        
         .card {
-            background: rgba(255, 255, 255, 0.75);
-            backdrop-filter: blur(30px) saturate(200%);
-            -webkit-backdrop-filter: blur(30px) saturate(200%);
-            border-radius: 24px;
-            padding: 28px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.05);
-            border: 0.5px solid rgba(0, 0, 0, 0.06);
-            will-change: transform;
+            background:rgba(255,255,255,0.78); backdrop-filter:blur(30px) saturate(200%);
+            -webkit-backdrop-filter:blur(30px) saturate(200%);
+            border-radius:24px; padding:28px; margin-bottom:20px;
+            box-shadow:0 4px 24px rgba(0,0,0,0.07),0 1px 3px rgba(0,0,0,0.05);
+            border:0.5px solid rgba(0,0,0,0.06);
         }
-        
-        .form-group {
-            margin-bottom: 24px;
+        .form-group { margin-bottom:22px; }
+        .form-group:last-child { margin-bottom:0; }
+        .form-group > label {
+            display:block; font-size:12px; font-weight:600; color:#86868b;
+            margin-bottom:8px; text-transform:uppercase; letter-spacing:0.5px;
         }
-        
-        .form-group:last-child {
-            margin-bottom: 0;
+        .form-group input, .form-group textarea {
+            width:100%; padding:13px 15px; font-size:16px; color:#1d1d1f;
+            background:rgba(142,142,147,0.12); border:2px solid transparent;
+            border-radius:12px; outline:none;
+            transition:all 0.2s cubic-bezier(0.4,0,0.2,1); -webkit-appearance:none;
         }
-        
-        .form-group label {
-            display: block;
-            font-size: 13px;
-            font-weight: 600;
-            color: #86868b;
-            margin-bottom: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        .form-group input,
         .form-group textarea {
-            width: 100%;
-            padding: 14px 16px;
-            font-size: 17px;
-            font-weight: 400;
-            color: #1d1d1f;
-            background: rgba(142, 142, 147, 0.12);
-            border: 2px solid transparent;
-            border-radius: 12px;
-            outline: none;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-            -webkit-appearance: none;
+            min-height:96px; resize:vertical; font-size:13px;
+            font-family:'SF Mono','Menlo','Courier New',monospace; line-height:1.5;
         }
-        
-        .form-group textarea {
-            min-height: 100px;
-            resize: vertical;
-            font-size: 14px;
-            font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
-            line-height: 1.5;
+        .form-group input:focus, .form-group textarea:focus {
+            background:rgba(142,142,147,0.18); border-color:#007AFF;
         }
-        
-        .form-group input:focus,
-        .form-group textarea:focus {
-            background: rgba(142, 142, 147, 0.16);
-            border-color: #007AFF;
-            transform: scale(1.005);
-        }
-        
-        .form-group input::placeholder,
-        .form-group textarea::placeholder {
-            color: #86868b;
-        }
-        
-        .form-group small {
-            display: block;
-            margin-top: 8px;
-            color: #86868b;
-            font-size: 13px;
-            line-height: 1.4;
+        .form-group input::placeholder, .form-group textarea::placeholder { color:#aeaeb2; }
+        .form-group small { display:block; margin-top:7px; color:#86868b; font-size:12px; line-height:1.5; }
+        .form-group input:disabled, .form-group textarea:disabled {
+            opacity:0.38; pointer-events:none;
         }
 
-        .ip-count-badge {
-            display: inline-block;
-            margin-left: 8px;
-            padding: 2px 8px;
-            background: rgba(0,122,255,0.12);
-            color: #007AFF;
-            border-radius: 10px;
-            font-size: 12px;
-            font-weight: 600;
-            vertical-align: middle;
+        /* 分割线 */
+        .divider {
+            height:0.5px; background:rgba(0,0,0,0.08); margin:4px -28px 20px;
         }
 
-        .url-list-item {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 8px;
-            align-items: center;
+        /* 节点来源区 */
+        .node-source-box {
+            background:rgba(88,86,214,0.06); border:1.5px solid rgba(88,86,214,0.18);
+            border-radius:16px; padding:18px; margin-bottom:0;
+            transition: border-color 0.2s;
         }
-        .url-list-item input {
-            flex: 1;
-            padding: 10px 12px;
-            font-size: 14px;
-            color: #1d1d1f;
-            background: rgba(142, 142, 147, 0.12);
-            border: 2px solid transparent;
-            border-radius: 10px;
-            outline: none;
-            transition: all 0.2s;
-            -webkit-appearance: none;
+        .node-source-box.active-mode {
+            background:rgba(88,86,214,0.1); border-color:rgba(88,86,214,0.4);
         }
-        .url-list-item input:focus {
-            background: rgba(142, 142, 147, 0.18);
-            border-color: #007AFF;
+        .node-source-label {
+            font-size:12px; font-weight:700; color:#5856D6; text-transform:uppercase;
+            letter-spacing:0.6px; margin-bottom:12px;
+            display:flex; align-items:center; gap:8px;
         }
-        .url-list-item .remove-btn {
-            width: 32px;
-            height: 32px;
-            border: none;
-            background: rgba(255,59,48,0.12);
-            color: #FF3B30;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 18px;
-            line-height: 1;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            flex-shrink: 0;
-            transition: background 0.15s;
+        .node-mode-badge {
+            display:inline-block; padding:2px 8px; background:#5856D6; color:#fff;
+            border-radius:8px; font-size:11px; font-weight:600;
         }
-        .url-list-item .remove-btn:active {
-            background: rgba(255,59,48,0.22);
-        }
-        .add-url-btn {
-            width: 100%;
-            padding: 10px;
-            font-size: 14px;
-            font-weight: 600;
-            color: #007AFF;
-            background: rgba(0,122,255,0.08);
-            border: 1.5px dashed rgba(0,122,255,0.35);
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.15s;
-            margin-top: 4px;
-        }
-        .add-url-btn:hover { background: rgba(0,122,255,0.12); }
-        .add-url-btn:active { background: rgba(0,122,255,0.18); }
-        
+
+        /* 开关列 */
         .list-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 16px 0;
-            min-height: 52px;
-            cursor: pointer;
-            border-bottom: 0.5px solid rgba(0, 0, 0, 0.08);
-            transition: background-color 0.15s ease;
+            display:flex; align-items:center; justify-content:space-between;
+            padding:14px 0; min-height:50px; cursor:pointer;
+            border-bottom:0.5px solid rgba(0,0,0,0.08);
+            transition:background-color 0.15s ease;
         }
-        
-        .list-item:last-child {
-            border-bottom: none;
-        }
-        
-        .list-item:active {
-            background-color: rgba(142, 142, 147, 0.08);
-            margin: 0 -28px;
-            padding-left: 28px;
-            padding-right: 28px;
-        }
-        
-        .list-item-label {
-            font-size: 17px;
-            font-weight: 400;
-            color: #1d1d1f;
-            flex: 1;
-        }
-        
-        .list-item-description {
-            font-size: 13px;
-            color: #86868b;
-            margin-top: 4px;
-            line-height: 1.4;
-        }
-        
+        .list-item:last-child { border-bottom:none; }
+        .list-item:active { background:rgba(142,142,147,0.08); margin:0 -28px; padding-left:28px; padding-right:28px; }
+        .list-item-label { font-size:16px; font-weight:400; color:#1d1d1f; flex:1; }
+        .list-item-description { font-size:12px; color:#86868b; margin-top:3px; line-height:1.4; }
+        .list-item.disabled { opacity:0.35; pointer-events:none; }
         .switch {
-            position: relative;
-            width: 51px;
-            height: 31px;
-            background: rgba(142, 142, 147, 0.3);
-            border-radius: 16px;
-            transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            cursor: pointer;
-            flex-shrink: 0;
+            position:relative; width:51px; height:31px;
+            background:rgba(142,142,147,0.3); border-radius:16px;
+            transition:background 0.3s cubic-bezier(0.4,0,0.2,1); cursor:pointer; flex-shrink:0;
         }
-        
-        .switch.active {
-            background: #34C759;
-        }
-        
+        .switch.active { background:#34C759; }
         .switch::after {
-            content: '';
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            width: 27px;
-            height: 27px;
-            background: #ffffff;
-            border-radius: 50%;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15), 0 1px 2px rgba(0, 0, 0, 0.1);
+            content:''; position:absolute; top:2px; left:2px; width:27px; height:27px;
+            background:#fff; border-radius:50%;
+            transition:transform 0.3s cubic-bezier(0.4,0,0.2,1);
+            box-shadow:0 2px 6px rgba(0,0,0,0.15),0 1px 2px rgba(0,0,0,0.1);
         }
-        
-        .switch.active::after {
-            transform: translateX(20px);
-        }
-        
+        .switch.active::after { transform:translateX(20px); }
+
+        /* 按钮 */
         .btn {
-            width: 100%;
-            padding: 16px;
-            font-size: 17px;
-            font-weight: 600;
-            color: #ffffff;
-            background: #007AFF;
-            border: none;
-            border-radius: 14px;
-            cursor: pointer;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-            margin-top: 8px;
-            -webkit-appearance: none;
-            box-shadow: 0 4px 12px rgba(0, 122, 255, 0.25);
-            will-change: transform;
+            width:100%; padding:15px; font-size:16px; font-weight:600; color:#fff;
+            background:#007AFF; border:none; border-radius:14px; cursor:pointer;
+            transition:all 0.2s cubic-bezier(0.4,0,0.2,1); margin-top:8px;
+            -webkit-appearance:none; box-shadow:0 4px 12px rgba(0,122,255,0.25);
         }
-        
-        .btn:hover {
-            background: #0051D5;
-            box-shadow: 0 6px 16px rgba(0, 122, 255, 0.3);
-        }
-        
-        .btn:active {
-            transform: scale(0.97);
-            box-shadow: 0 2px 8px rgba(0, 122, 255, 0.2);
-        }
-        
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .btn-orange {
-            background: #FF9500;
-            box-shadow: 0 4px 12px rgba(255,149,0,0.25);
-        }
-        .btn-orange:hover { background: #CC7700; }
-        
-        .btn-secondary {
-            background: rgba(142, 142, 147, 0.12);
-            color: #007AFF;
-            box-shadow: none;
-        }
-        
-        .btn-secondary:hover {
-            background: rgba(142, 142, 147, 0.16);
-        }
-        
-        .btn-secondary:active {
-            background: rgba(142, 142, 147, 0.2);
-        }
-        
-        .result {
-            margin-top: 20px;
-            padding: 16px;
-            background: rgba(142, 142, 147, 0.12);
-            border-radius: 12px;
-            font-size: 15px;
-            color: #1d1d1f;
-            word-break: break-all;
-            display: none;
-            line-height: 1.5;
-        }
-        
-        .result.show {
-            display: block;
-        }
-        
-        .result-card {
-            padding: 16px;
-            background: rgba(255, 255, 255, 0.9);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border-radius: 12px;
-            margin-bottom: 12px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-            border: 0.5px solid rgba(0, 0, 0, 0.06);
-        }
-        
-        .result-url {
-            margin-top: 12px;
-            padding: 12px;
-            background: rgba(0, 122, 255, 0.1);
-            border-radius: 10px;
-            font-size: 13px;
-            color: #007aff;
-            word-break: break-all;
-            line-height: 1.5;
-        }
-        
-        .copy-btn {
-            margin-top: 8px;
-            padding: 10px 16px;
-            font-size: 15px;
-            background: rgba(0, 122, 255, 0.1);
-            color: #007aff;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-        
-        .copy-btn:active {
-            background: rgba(0, 122, 255, 0.2);
-            transform: scale(0.98);
-        }
-        
+        .btn:hover { background:#0051D5; box-shadow:0 6px 16px rgba(0,122,255,0.3); }
+        .btn:active { transform:scale(0.97); }
+        .btn:disabled { opacity:0.4; cursor:not-allowed; transform:none; }
+        .btn-secondary { background:rgba(142,142,147,0.12); color:#007AFF; box-shadow:none; }
+        .btn-secondary:hover { background:rgba(142,142,147,0.18); }
         .client-btn {
-            padding: 12px 16px;
-            font-size: 14px;
-            font-weight: 500;
-            color: #007AFF;
-            background: rgba(0, 122, 255, 0.1);
-            border: 1px solid rgba(0, 122, 255, 0.2);
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-            -webkit-appearance: none;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            min-width: 0;
+            padding:11px 14px; font-size:14px; font-weight:500; color:#007AFF;
+            background:rgba(0,122,255,0.1); border:1px solid rgba(0,122,255,0.2);
+            border-radius:12px; cursor:pointer;
+            transition:all 0.2s cubic-bezier(0.4,0,0.2,1); -webkit-appearance:none;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;
         }
-        
-        .client-btn:active {
-            transform: scale(0.97);
-            background: rgba(0, 122, 255, 0.2);
-            border-color: rgba(0, 122, 255, 0.3);
+        .client-btn:active { transform:scale(0.97); background:rgba(0,122,255,0.2); }
+        .client-btn.node-mode {
+            color:#5856D6; background:rgba(88,86,214,0.1); border-color:rgba(88,86,214,0.25);
         }
-        
-        .checkbox-label {
-            display: flex;
-            align-items: center;
-            cursor: pointer;
-            font-size: 17px;
-            font-weight: 400;
-            user-select: none;
-            -webkit-user-select: none;
-            position: relative;
-            z-index: 1;
-            padding: 8px 0;
-        }
-        
-        .checkbox-label input[type="checkbox"] {
-            margin-right: 12px;
-            width: 22px;
-            height: 22px;
-            cursor: pointer;
-            flex-shrink: 0;
-            position: relative;
-            z-index: 2;
-            -webkit-appearance: checkbox;
-            appearance: checkbox;
-        }
-        
-        .checkbox-label span {
-            cursor: pointer;
-            position: relative;
-            z-index: 1;
-        }
-        
-        @media (max-width: 480px) {
-            .client-btn {
-                font-size: 12px;
-                padding: 10px 12px;
-            }
-            
-            .header h1 {
-                font-size: 34px;
-            }
-        }
-        
-        .footer {
-            text-align: center;
-            padding: 32px 20px;
-            color: #86868b;
-            font-size: 13px;
-        }
-        
-        .footer a {
-            color: #007AFF;
-            text-decoration: none;
-            font-weight: 500;
-            transition: opacity 0.2s ease;
-        }
-        
-        .footer a:active {
-            opacity: 0.6;
-        }
-        
-        @media (prefers-color-scheme: dark) {
-            body {
-                background: linear-gradient(180deg, #000000 0%, #1c1c1e 50%, #2c2c2e 100%);
-                color: #f5f5f7;
-            }
-            
-            .card {
-                background: rgba(28, 28, 30, 0.75);
-                border: 0.5px solid rgba(255, 255, 255, 0.12);
-                box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
-            }
-            
-            .form-group input,
-            .form-group textarea {
-                background: rgba(142, 142, 147, 0.2);
-                color: #f5f5f7;
-            }
-            
-            .form-group input:focus,
-            .form-group textarea:focus {
-                background: rgba(142, 142, 147, 0.25);
-                border-color: #5ac8fa;
-            }
-            
-            .list-item {
-                border-bottom-color: rgba(255, 255, 255, 0.1);
-            }
-            
-            .list-item:active {
-                background-color: rgba(255, 255, 255, 0.08);
-            }
-            
-            .list-item-label {
-                color: #f5f5f7;
-            }
-            
-            .switch {
-                background: rgba(142, 142, 147, 0.4);
-            }
-            
-            .switch.active {
-                background: #30d158;
-            }
-            
-            .switch::after {
-                background: #ffffff;
-            }
-            
-            .result {
-                background: rgba(142, 142, 147, 0.2);
-                color: #f5f5f7;
-            }
-            
-            .result-card {
-                background: rgba(28, 28, 30, 0.9);
-                border-color: rgba(255, 255, 255, 0.1);
-            }
-            
-            .checkbox-label span {
-                color: #f5f5f7;
-            }
-            
-            .client-btn {
-                background: rgba(0, 122, 255, 0.15) !important;
-                border-color: rgba(0, 122, 255, 0.3) !important;
-                color: #5ac8fa !important;
-            }
-            
-            .footer a {
-                color: #5ac8fa !important;
-            }
 
-            .url-list-item input {
-                background: rgba(142, 142, 147, 0.2);
-                color: #f5f5f7;
-            }
+        /* URL列表 */
+        .url-list-item { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+        .url-list-item input {
+            flex:1; padding:10px 12px; font-size:13px; color:#1d1d1f;
+            background:rgba(142,142,147,0.12); border:2px solid transparent;
+            border-radius:10px; outline:none; transition:all 0.2s; -webkit-appearance:none;
+        }
+        .url-list-item input:focus { background:rgba(142,142,147,0.18); border-color:#007AFF; }
+        .url-list-item .remove-btn {
+            width:32px; height:32px; border:none;
+            background:rgba(255,59,48,0.1); color:#FF3B30;
+            border-radius:8px; cursor:pointer; font-size:18px;
+            display:flex; align-items:center; justify-content:center; flex-shrink:0;
+            transition:background 0.15s;
+        }
+        .url-list-item .remove-btn:active { background:rgba(255,59,48,0.22); }
+        .add-url-btn {
+            width:100%; padding:9px; font-size:13px; font-weight:600; color:#007AFF;
+            background:rgba(0,122,255,0.07); border:1.5px dashed rgba(0,122,255,0.3);
+            border-radius:10px; cursor:pointer; transition:all 0.15s; margin-top:2px;
+        }
+        .add-url-btn:hover { background:rgba(0,122,255,0.12); }
+        .add-url-btn.purple {
+            color:#5856D6; background:rgba(88,86,214,0.07); border-color:rgba(88,86,214,0.3);
+        }
+        .add-url-btn.purple:hover { background:rgba(88,86,214,0.12); }
+
+        /* 复选框 */
+        .checkbox-label {
+            display:flex; align-items:center; cursor:pointer; font-size:16px;
+            user-select:none; -webkit-user-select:none; padding:7px 0;
+        }
+        .checkbox-label input[type="checkbox"] {
+            margin-right:11px; width:22px; height:22px; cursor:pointer; flex-shrink:0;
+            -webkit-appearance:checkbox; appearance:checkbox;
+        }
+        .checkbox-label.disabled { opacity:0.35; pointer-events:none; }
+
+        /* 结果URL */
+        .result-url {
+            margin-top:12px; padding:11px 13px;
+            background:rgba(0,122,255,0.08); border-radius:10px;
+            font-size:12px; color:#007aff; word-break:break-all; line-height:1.5;
+        }
+        .result-url.purple { background:rgba(88,86,214,0.08); color:#5856D6; }
+
+        /* 徽标 */
+        .badge {
+            display:inline-block; margin-left:7px; padding:2px 8px;
+            background:rgba(0,122,255,0.12); color:#007AFF;
+            border-radius:9px; font-size:11px; font-weight:600; vertical-align:middle;
+        }
+        .badge.purple { background:rgba(88,86,214,0.12); color:#5856D6; }
+        .badge.green { background:rgba(52,199,89,0.12); color:#34C759; }
+
+        /* 模式提示条 */
+        .mode-banner {
+            display:none; padding:10px 14px; border-radius:12px; font-size:13px;
+            font-weight:500; margin-bottom:16px; line-height:1.4;
+        }
+        .mode-banner.node { background:rgba(88,86,214,0.1); color:#5856D6; display:block; }
+
+        .footer { text-align:center; padding:28px 20px; color:#86868b; font-size:13px; }
+        .footer a { color:#007AFF; text-decoration:none; font-weight:500; }
+        .footer a:active { opacity:0.6; }
+
+        @media (max-width:480px) {
+            .header h1 { font-size:32px; }
+            .client-btn { font-size:12px; padding:10px 11px; }
+        }
+
+        @media (prefers-color-scheme: dark) {
+            body { background:linear-gradient(180deg,#000 0%,#1c1c1e 50%,#2c2c2e 100%); color:#f5f5f7; }
+            .card { background:rgba(28,28,30,0.78); border:0.5px solid rgba(255,255,255,0.1); box-shadow:0 4px 24px rgba(0,0,0,0.35); }
+            .form-group input, .form-group textarea { background:rgba(142,142,147,0.2); color:#f5f5f7; }
+            .form-group input:focus, .form-group textarea:focus { background:rgba(142,142,147,0.26); border-color:#5ac8fa; }
+            .list-item { border-bottom-color:rgba(255,255,255,0.09); }
+            .list-item-label { color:#f5f5f7; }
+            .list-item:active { background:rgba(255,255,255,0.07); }
+            .switch { background:rgba(142,142,147,0.38); }
+            .switch.active { background:#30d158; }
+            .divider { background:rgba(255,255,255,0.09); }
+            .node-source-box { background:rgba(88,86,214,0.08); border-color:rgba(88,86,214,0.25); }
+            .node-source-box.active-mode { background:rgba(88,86,214,0.14); border-color:rgba(88,86,214,0.5); }
+            .url-list-item input { background:rgba(142,142,147,0.2); color:#f5f5f7; }
+            .checkbox-label { color:#f5f5f7; }
+            .client-btn { background:rgba(0,122,255,0.14)!important; border-color:rgba(0,122,255,0.3)!important; color:#5ac8fa!important; }
+            .client-btn.node-mode { color:#a29bf4!important; background:rgba(88,86,214,0.16)!important; border-color:rgba(88,86,214,0.35)!important; }
+            .footer a { color:#5ac8fa!important; }
+            .result-url { background:rgba(0,122,255,0.12); }
+            .result-url.purple { background:rgba(88,86,214,0.14); color:#a29bf4; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>服务器优选工具</h1>
-            <p>智能优选 • 一键生成</p>
-        </div>
-        
-        <!-- ===================== 原有功能卡片 ===================== -->
-        <div class="section-title">标准订阅生成</div>
-        <div class="card">
-            <div class="form-group">
-                <label>域名</label>
-                <input type="text" id="domain" placeholder="请输入您的域名">
-            </div>
-            
-            <div class="form-group">
-                <label>UUID/Password</label>
-                <input type="text" id="uuid" placeholder="请输入UUID或Password">
-            </div>
-            
-            <div class="form-group">
-                <label>WebSocket路径（可选）</label>
-                <input type="text" id="customPath" placeholder="留空则使用默认路径 /" value="/">
-                <small>自定义WebSocket路径，例如：/v2ray 或 /</small>
-            </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchDomain')">
-                <div>
-                    <div class="list-item-label">启用优选域名</div>
-                </div>
-                <div class="switch active" id="switchDomain"></div>
-            </div>
+<div class="container">
+    <div class="header">
+        <h1>服务器优选工具</h1>
+        <p>智能优选 • 一键生成</p>
+    </div>
 
-            <!-- 新功能2：自定义域名URL输入 -->
-            <div class="form-group" id="customDomainUrlGroup" style="margin-top: 12px; padding: 16px; background: rgba(52,199,89,0.06); border-radius: 14px; border: 1px solid rgba(52,199,89,0.2);">
-                <label style="color: #34C759;">从URL获取优选域名（新功能）</label>
-                <div id="domainUrlList">
-                    <div class="url-list-item">
-                        <input type="text" placeholder="输入包含优选域名列表的URL" data-domain-url>
-                        <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>
-                    </div>
-                </div>
-                <button class="add-url-btn" onclick="addDomainUrl()">＋ 添加域名URL</button>
-                <small style="margin-top: 8px;">每行一个域名的文本文件URL，自动合并到优选域名列表</small>
+    <!-- ===== 主功能卡片 ===== -->
+    <div class="section-title">订阅生成</div>
+    <div class="card">
+
+        <!-- 基础信息 -->
+        <div class="form-group">
+            <label>Worker 域名</label>
+            <input type="text" id="domain" placeholder="请输入您部署的 Worker 域名">
+        </div>
+        <div class="form-group">
+            <label>UUID / Password</label>
+            <input type="text" id="uuid" placeholder="请输入 UUID 或 Password">
+        </div>
+        <div class="form-group">
+            <label>WebSocket 路径（可选）</label>
+            <input type="text" id="customPath" value="/" placeholder="留空使用默认 /">
+            <small>自定义 WS 路径，如 /v2ray 或 /</small>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- 优选域名 -->
+        <div class="list-item" id="rowDomain" onclick="toggleSwitch('switchDomain')">
+            <div>
+                <div class="list-item-label">启用优选域名</div>
             </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchIP')">
-                <div>
-                    <div class="list-item-label">启用优选IP</div>
-                </div>
-                <div class="switch active" id="switchIP"></div>
-            </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchGitHub')">
-                <div>
-                    <div class="list-item-label">启用自定义优选IP</div>
-                </div>
-                <div class="switch active" id="switchGitHub"></div>
-            </div>
-            
-            <!-- 新功能3：批量优选IP URL -->
-            <div class="form-group" id="githubUrlGroup" style="margin-top: 12px; padding: 16px; background: rgba(0,122,255,0.06); border-radius: 14px; border: 1px solid rgba(0,122,255,0.15);">
-                <label style="color: #007AFF;">优选IP来源URL <span class="ip-count-badge">最多30个IP</span></label>
-                <div id="ipUrlList">
-                    <div class="url-list-item">
-                        <input type="text" placeholder="留空则使用默认地址" data-ip-url>
-                        <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>
-                    </div>
-                </div>
-                <button class="add-url-btn" onclick="addIPUrl()">＋ 添加IP来源URL</button>
-                <small style="margin-top: 8px;">支持多个URL，自动合并去重，总IP数上限30个</small>
-            </div>
-            
-            <div class="form-group" style="margin-top: 24px;">
-                <label>协议选择</label>
-                <div style="margin-top: 8px;">
-                    <div class="list-item" onclick="toggleSwitch('switchVL')">
-                        <div>
-                            <div class="list-item-label">VLESS (vl)</div>
-                        </div>
-                        <div class="switch active" id="switchVL"></div>
-                    </div>
-                    <div class="list-item" onclick="toggleSwitch('switchTJ')">
-                        <div>
-                            <div class="list-item-label">Trojan (tj)</div>
-                        </div>
-                        <div class="switch" id="switchTJ"></div>
-                    </div>
-                    <div class="list-item" onclick="toggleSwitch('switchVM')">
-                        <div>
-                            <div class="list-item-label">VMess (vm)</div>
-                        </div>
-                        <div class="switch" id="switchVM"></div>
-                    </div>
+            <div class="switch active" id="switchDomain"></div>
+        </div>
+        <div class="form-group" style="margin-top:12px; padding:14px; background:rgba(52,199,89,0.06); border-radius:14px; border:1px solid rgba(52,199,89,0.18);">
+            <label style="color:#34C759;">从 URL 获取优选域名 <span class="badge green">新</span></label>
+            <div id="domainUrlList">
+                <div class="url-list-item">
+                    <input type="text" placeholder="每行一个域名的文本 URL（可选）" data-domain-url>
+                    <button class="remove-btn" onclick="removeUrlItem(this)">×</button>
                 </div>
             </div>
-            
-            <div class="form-group" style="margin-top: 24px;">
-                <label>客户端选择</label>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 8px;">
-                    <button type="button" class="client-btn" onclick="generateClientLink('clash', 'CLASH')">CLASH</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('clash', 'STASH')">STASH</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('surge', 'SURGE')">SURGE</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('sing-box', 'SING-BOX')">SING-BOX</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('loon', 'LOON')">LOON</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('quanx', 'QUANTUMULT X')" style="font-size: 13px;">QUANTUMULT X</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'V2RAY')">V2RAY</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'V2RAYNG')">V2RAYNG</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'NEKORAY')">NEKORAY</button>
-                    <button type="button" class="client-btn" onclick="generateClientLink('v2ray', 'Shadowrocket')" style="font-size: 13px;">Shadowrocket</button>
-                </div>
-                <div class="result-url" id="clientSubscriptionUrl" style="display: none; margin-top: 12px; padding: 12px; background: rgba(0, 122, 255, 0.1); border-radius: 8px; font-size: 13px; color: #007aff; word-break: break-all;"></div>
-            </div>
-            
-            <div class="form-group">
-                <label>IP版本选择</label>
-                <div style="display: flex; gap: 16px; margin-top: 8px;">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ipv4Enabled" checked>
-                        <span>IPv4</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ipv6Enabled" checked>
-                        <span>IPv6</span>
-                    </label>
+            <button class="add-url-btn" style="color:#34C759;border-color:rgba(52,199,89,0.3);background:rgba(52,199,89,0.07);" onclick="addUrlToList('domainUrlList','输入包含域名的文本URL','data-domain-url')">＋ 添加域名 URL</button>
+        </div>
+
+        <!-- 优选IP -->
+        <div class="list-item" id="rowIP" onclick="toggleSwitch('switchIP')" style="margin-top:8px;">
+            <div><div class="list-item-label">启用 wetest 优选IP</div></div>
+            <div class="switch active" id="switchIP"></div>
+        </div>
+        <div class="list-item" id="rowGitHub" onclick="toggleSwitch('switchGitHub')">
+            <div><div class="list-item-label">启用自定义优选IP <span class="badge">最多30</span></div></div>
+            <div class="switch active" id="switchGitHub"></div>
+        </div>
+        <div class="form-group" style="margin-top:12px; padding:14px; background:rgba(0,122,255,0.05); border-radius:14px; border:1px solid rgba(0,122,255,0.14);">
+            <label style="color:#007AFF;">优选IP来源 URL <span class="badge">新·多URL</span></label>
+            <div id="ipUrlList">
+                <div class="url-list-item">
+                    <input type="text" placeholder="留空则使用默认地址" data-ip-url>
+                    <button class="remove-btn" onclick="removeUrlItem(this)">×</button>
                 </div>
             </div>
-            
-            <div class="form-group">
-                <label>运营商选择</label>
-                <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispMobile" checked>
-                        <span>移动</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispUnicom" checked>
-                        <span>联通</span>
-                    </label>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ispTelecom" checked>
-                        <span>电信</span>
-                    </label>
-                </div>
+            <button class="add-url-btn" onclick="addUrlToList('ipUrlList','输入优选IP来源URL','data-ip-url')">＋ 添加 IP 来源 URL</button>
+            <small style="margin-top:6px;">支持多个URL并发拉取，自动去重，上限30个</small>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- 协议选择 -->
+        <div id="protocolSection">
+            <div style="font-size:12px;font-weight:600;color:#86868b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">协议选择</div>
+            <div class="list-item" id="rowVL" onclick="toggleSwitch('switchVL')">
+                <div><div class="list-item-label">VLESS</div></div>
+                <div class="switch active" id="switchVL"></div>
             </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchTLS')" style="margin-top: 8px;">
-                <div>
-                    <div class="list-item-label">仅TLS节点</div>
-                    <div class="list-item-description">启用后只生成带TLS的节点，不生成非TLS节点（如80端口）</div>
-                </div>
-                <div class="switch" id="switchTLS"></div>
+            <div class="list-item" id="rowTJ" onclick="toggleSwitch('switchTJ')">
+                <div><div class="list-item-label">Trojan</div></div>
+                <div class="switch" id="switchTJ"></div>
             </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchECH')" style="margin-top: 8px;">
-                <div>
-                    <div class="list-item-label">ECH (Encrypted Client Hello)</div>
-                    <div class="list-item-description">启用后节点链接将携带 ECH 参数，需客户端支持；开启时自动仅TLS</div>
-                </div>
-                <div class="switch" id="switchECH"></div>
-            </div>
-            <div class="form-group" id="echOptionsGroup" style="margin-top: 12px; display: none;">
-                <label>ECH 自定义 DNS（可选）</label>
-                <input type="text" id="customDNS" placeholder="例如: https://dns.joeyblog.eu.org/joeyblog" style="font-size: 14px;">
-                <small>用于 ECH 配置查询的 DoH 地址</small>
-                <label style="margin-top: 12px; display: block;">ECH 域名（可选）</label>
-                <input type="text" id="customECHDomain" placeholder="例如: cloudflare-ech.com" style="font-size: 14px;">
+            <div class="list-item" id="rowVM" onclick="toggleSwitch('switchVM')">
+                <div><div class="list-item-label">VMess</div></div>
+                <div class="switch" id="switchVM"></div>
             </div>
         </div>
 
-        <!-- ===================== 新功能1：节点IP替换 ===================== -->
-        <div class="section-title" style="margin-top: 8px;">节点IP批量替换</div>
-        <div class="card">
-            <div class="form-group">
-                <label>原始节点列表</label>
-                <textarea id="replaceNodes" placeholder="粘贴您的原始节点链接，每行一个&#10;支持 VLESS / Trojan / VMess 格式&#10;&#10;示例：&#10;vless://uuid@example.com:443?...#节点名&#10;trojan://password@example.com:443?...#节点名"></textarea>
-                <small>将保留节点的所有原始参数（UUID、路径、SNI等），仅替换连接IP地址</small>
-            </div>
+        <div class="divider"></div>
 
-            <div class="form-group">
-                <label>优选IP来源 <span class="ip-count-badge">最多30个IP</span></label>
-                <div id="replaceIPUrlList">
+        <!-- ===== 节点来源（新功能）===== -->
+        <div class="node-source-box" id="nodeSourceBox">
+            <div class="node-source-label">
+                节点来源
+                <span class="node-mode-badge" id="nodeModeBadge" style="display:none;">节点替换模式已激活</span>
+            </div>
+            <div class="form-group" style="margin-bottom:14px;">
+                <label style="color:#5856D6;">从订阅URL自动拉取节点</label>
+                <div id="nodeUrlList">
                     <div class="url-list-item">
-                        <input type="text" placeholder="输入优选IP列表URL（留空则用wetest默认IP）" data-replace-ip-url>
-                        <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>
+                        <input type="text" placeholder="输入节点订阅链接URL（支持 base64 或明文）" data-node-url oninput="onNodeInputChange()">
+                        <button class="remove-btn" onclick="removeUrlItem(this); onNodeInputChange()">×</button>
                     </div>
                 </div>
-                <button class="add-url-btn" onclick="addReplaceIPUrl()">＋ 添加优选IP URL</button>
+                <button class="add-url-btn purple" onclick="addUrlToList('nodeUrlList','输入订阅URL','data-node-url',true)">＋ 添加订阅 URL</button>
             </div>
-
-            <div class="form-group">
-                <label>IP版本 & 运营商筛选</label>
-                <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
-                    <label class="checkbox-label"><input type="checkbox" id="replaceIPv4" checked><span>IPv4</span></label>
-                    <label class="checkbox-label"><input type="checkbox" id="replaceIPv6" checked><span>IPv6</span></label>
-                    <label class="checkbox-label"><input type="checkbox" id="replaceMobile" checked><span>移动</span></label>
-                    <label class="checkbox-label"><input type="checkbox" id="replaceUnicom" checked><span>联通</span></label>
-                    <label class="checkbox-label"><input type="checkbox" id="replaceTelecom" checked><span>电信</span></label>
-                </div>
-                <label class="checkbox-label" style="margin-top: 8px;">
-                    <input type="checkbox" id="replaceUseWetest" checked>
-                    <span>同时使用 wetest 优选IP</span>
-                </label>
-            </div>
-
-            <div class="form-group">
-                <label>客户端格式</label>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 8px;">
-                    <button type="button" class="client-btn btn-orange" style="background:rgba(255,149,0,0.12);color:#FF9500;border-color:rgba(255,149,0,0.3);" onclick="generateReplaceSubLink('base64', 'V2RAY/Base64')">V2RAY/Base64</button>
-                    <button type="button" class="client-btn btn-orange" style="background:rgba(255,149,0,0.12);color:#FF9500;border-color:rgba(255,149,0,0.3);" onclick="generateReplaceSubLink('clash', 'CLASH')">CLASH</button>
-                    <button type="button" class="client-btn btn-orange" style="background:rgba(255,149,0,0.12);color:#FF9500;border-color:rgba(255,149,0,0.3);" onclick="generateReplaceSubLink('clash', 'STASH')">STASH</button>
-                    <button type="button" class="client-btn btn-orange" style="background:rgba(255,149,0,0.12);color:#FF9500;border-color:rgba(255,149,0,0.3);" onclick="generateReplaceSubLink('v2ray', 'Shadowrocket')" style="font-size:13px">Shadowrocket</button>
-                </div>
-                <div class="result-url" id="replaceSubUrl" style="display: none; margin-top: 12px; padding: 12px; background: rgba(255,149,0,0.1); border-radius: 8px; font-size: 13px; color: #FF9500; word-break: break-all;"></div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label style="color:#5856D6;">手动输入节点</label>
+                <textarea id="manualNodes" placeholder="粘贴节点链接，每行一个&#10;支持 vless:// / trojan:// / vmess://" oninput="onNodeInputChange()"></textarea>
+                <small>填入节点后，将保留原始参数（UUID/路径/SNI），仅替换连接IP为优选IP。协议选择将自动禁用。</small>
             </div>
         </div>
-        
-        <div class="footer">
-            <p>服务器优选工具 • 节点生成 & IP替换</p>
-            <div style="margin-top: 20px; display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;">
-                <a href="https://github.com/byJoey/yx-auto" target="_blank">GitHub 项目</a>
-                <a href="https://www.youtube.com/@joeyblog" target="_blank">YouTube @joeyblog</a>
+
+        <div class="divider"></div>
+
+        <!-- 客户端选择（共用） -->
+        <div class="form-group">
+            <label>客户端选择</label>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:9px;margin-top:8px;" id="clientBtnGrid">
+                <button type="button" class="client-btn" data-client="clash"    data-name="CLASH">CLASH</button>
+                <button type="button" class="client-btn" data-client="clash"    data-name="STASH">STASH</button>
+                <button type="button" class="client-btn" data-client="surge"    data-name="SURGE">SURGE</button>
+                <button type="button" class="client-btn" data-client="sing-box" data-name="SING-BOX">SING-BOX</button>
+                <button type="button" class="client-btn" data-client="loon"     data-name="LOON">LOON</button>
+                <button type="button" class="client-btn" data-client="quanx"    data-name="QUANTUMULT X" style="font-size:12px;">QUANTUMULT X</button>
+                <button type="button" class="client-btn" data-client="v2ray"    data-name="V2RAY">V2RAY</button>
+                <button type="button" class="client-btn" data-client="v2ray"    data-name="V2RAYNG">V2RAYNG</button>
+                <button type="button" class="client-btn" data-client="v2ray"    data-name="NEKORAY">NEKORAY</button>
+                <button type="button" class="client-btn" data-client="v2ray"    data-name="Shadowrocket" style="font-size:12px;">Shadowrocket</button>
             </div>
+            <div class="result-url" id="subUrlDisplay" style="display:none;"></div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- IP版本（共用） -->
+        <div class="form-group">
+            <label>IP 版本</label>
+            <div style="display:flex;gap:18px;margin-top:8px;">
+                <label class="checkbox-label"><input type="checkbox" id="ipv4Enabled" checked><span>IPv4</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="ipv6Enabled" checked><span>IPv6</span></label>
+            </div>
+        </div>
+
+        <!-- 运营商（共用） -->
+        <div class="form-group">
+            <label>运营商</label>
+            <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:8px;">
+                <label class="checkbox-label"><input type="checkbox" id="ispMobile" checked><span>移动</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="ispUnicom" checked><span>联通</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="ispTelecom" checked><span>电信</span></label>
+            </div>
+        </div>
+
+        <!-- 仅TLS（共用） -->
+        <div class="list-item" id="rowTLS" onclick="toggleSwitch('switchTLS')">
+            <div>
+                <div class="list-item-label">仅 TLS 节点</div>
+                <div class="list-item-description">只生成/保留带 TLS 的节点，不含非TLS（如80端口）</div>
+            </div>
+            <div class="switch" id="switchTLS"></div>
+        </div>
+
+        <!-- ECH（节点模式时禁用） -->
+        <div class="list-item" id="rowECH" onclick="toggleSwitch('switchECH')">
+            <div>
+                <div class="list-item-label">ECH <span style="font-size:12px;color:#86868b;">(Encrypted Client Hello)</span></div>
+                <div class="list-item-description">携带 ECH 参数，需客户端支持；节点来源模式下不可用</div>
+            </div>
+            <div class="switch" id="switchECH"></div>
+        </div>
+        <div class="form-group" id="echOptionsGroup" style="display:none;">
+            <label>ECH 自定义 DNS（可选）</label>
+            <input type="text" id="customDNS" placeholder="例如: https://dns.joeyblog.eu.org/joeyblog" style="font-size:13px;">
+            <label style="margin-top:12px;display:block;">ECH 域名（可选）</label>
+            <input type="text" id="customECHDomain" placeholder="例如: cloudflare-ech.com" style="font-size:13px;">
+        </div>
+
+    </div>
+
+    <div class="footer">
+        <p>服务器优选工具 • 节点生成 & IP替换</p>
+        <div style="margin-top:18px;display:flex;justify-content:center;gap:24px;flex-wrap:wrap;">
+            <a href="https://github.com/byJoey/yx-auto" target="_blank">GitHub 项目</a>
+            <a href="https://www.youtube.com/@joeyblog" target="_blank">YouTube @joeyblog</a>
         </div>
     </div>
-    
-    <script>
-        let switches = {
-            switchDomain: true,
-            switchIP: true,
-            switchGitHub: true,
-            switchVL: true,
-            switchTJ: false,
-            switchVM: false,
-            switchTLS: false,
-            switchECH: false
-        };
-        
-        function toggleSwitch(id) {
-            const switchEl = document.getElementById(id);
-            switches[id] = !switches[id];
-            switchEl.classList.toggle('active');
-            if (id === 'switchECH') {
-                const echOpt = document.getElementById('echOptionsGroup');
-                if (echOpt) echOpt.style.display = switches.switchECH ? 'block' : 'none';
-                if (switches.switchECH && !switches.switchTLS) {
-                    switches.switchTLS = true;
-                    const tlsEl = document.getElementById('switchTLS');
-                    if (tlsEl) tlsEl.classList.add('active');
-                }
+</div>
+
+<script>
+    // ======== 状态 ========
+    let switches = {
+        switchDomain: true, switchIP: true, switchGitHub: true,
+        switchVL: true, switchTJ: false, switchVM: false,
+        switchTLS: false, switchECH: false
+    };
+    let nodeModeActive = false; // 节点来源模式
+
+    // ======== 开关 ========
+    function toggleSwitch(id) {
+        const el = document.getElementById(id);
+        if (!el || el.closest('.list-item')?.classList.contains('disabled')) return;
+        switches[id] = !switches[id];
+        el.classList.toggle('active');
+        if (id === 'switchECH') {
+            document.getElementById('echOptionsGroup').style.display = switches.switchECH ? 'block' : 'none';
+            if (switches.switchECH && !switches.switchTLS) {
+                switches.switchTLS = true;
+                document.getElementById('switchTLS').classList.add('active');
             }
         }
+    }
 
-        // ============ URL列表管理 ============
-        function removeUrlItem(btn) {
-            const item = btn.closest('.url-list-item');
-            const list = item.parentElement;
-            if (list.querySelectorAll('.url-list-item').length > 1) {
-                item.remove();
+    // ======== 节点来源检测 ========
+    function onNodeInputChange() {
+        const urlInputs = Array.from(document.querySelectorAll('[data-node-url]'));
+        const hasUrl = urlInputs.some(i => i.value.trim().startsWith('http'));
+        const hasManual = document.getElementById('manualNodes').value.trim().length > 0;
+        const active = hasUrl || hasManual;
+        if (active === nodeModeActive) return;
+        nodeModeActive = active;
+        applyNodeMode(active);
+    }
+
+    function applyNodeMode(active) {
+        // 协议区禁用
+        ['rowVL','rowTJ','rowVM'].forEach(id => {
+            document.getElementById(id)?.classList.toggle('disabled', active);
+        });
+        // ECH 禁用
+        const rowECH = document.getElementById('rowECH');
+        rowECH.classList.toggle('disabled', active);
+        if (active && switches.switchECH) {
+            switches.switchECH = false;
+            document.getElementById('switchECH').classList.remove('active');
+            document.getElementById('echOptionsGroup').style.display = 'none';
+        }
+        // 节点来源框视觉
+        document.getElementById('nodeSourceBox').classList.toggle('active-mode', active);
+        document.getElementById('nodeModeBadge').style.display = active ? 'inline-block' : 'none';
+        // 客户端按钮颜色提示
+        document.querySelectorAll('#clientBtnGrid .client-btn').forEach(btn => {
+            btn.classList.toggle('node-mode', active);
+        });
+        // 结果URL区颜色
+        const disp = document.getElementById('subUrlDisplay');
+        if (active) disp.classList.add('purple'); else disp.classList.remove('purple');
+    }
+
+    // ======== URL 列表管理 ========
+    function removeUrlItem(btn) {
+        const item = btn.closest('.url-list-item');
+        const list = item.parentElement;
+        if (list.querySelectorAll('.url-list-item').length > 1) {
+            item.remove();
+        } else {
+            item.querySelector('input').value = '';
+        }
+        // 如果是节点URL则重新检测
+        if (item.querySelector('[data-node-url]')) onNodeInputChange();
+    }
+
+    function addUrlToList(listId, placeholder, dataAttr, isNodeUrl = false) {
+        const list = document.getElementById(listId);
+        const div = document.createElement('div');
+        div.className = 'url-list-item';
+        const onInput = isNodeUrl ? ' oninput="onNodeInputChange()"' : '';
+        div.innerHTML = \`<input type="text" placeholder="\${placeholder}" \${dataAttr}="\${dataAttr}"\${onInput}>
+            <button class="remove-btn" onclick="removeUrlItem(this)\${isNodeUrl ? '; onNodeInputChange()' : ''}">×</button>\`;
+        list.appendChild(div);
+        div.querySelector('input').focus();
+    }
+
+    function getUrlsFromAttr(attr) {
+        return Array.from(document.querySelectorAll(\`[\${attr}]\`))
+            .map(i => i.value.trim()).filter(v => v.length > 0);
+    }
+
+    // ======== 订阅转换 ========
+    const SUB_CONVERTER_URL = "${ scu }";
+
+    function tryOpenApp(scheme, fallback, timeout = 2500) {
+        let opened = false, done = false;
+        const t0 = Date.now();
+        const onBlur = () => { if (Date.now()-t0 < 3000) opened = true; };
+        const onHide = () => { if (Date.now()-t0 < 3000) opened = true; };
+        window.addEventListener('blur', onBlur);
+        document.addEventListener('visibilitychange', onHide);
+        const iframe = document.createElement('iframe');
+        iframe.style.cssText = 'display:none;width:1px;height:1px;';
+        iframe.src = scheme;
+        document.body.appendChild(iframe);
+        setTimeout(() => {
+            iframe.parentNode?.removeChild(iframe);
+            window.removeEventListener('blur', onBlur);
+            document.removeEventListener('visibilitychange', onHide);
+            if (!done) { done = true; if (!opened && fallback) fallback(); }
+        }, timeout);
+    }
+
+    function copyAndAlert(text, name) {
+        navigator.clipboard.writeText(text).then(() => alert(name + ' 订阅链接已复制')).catch(() => alert('链接：' + text));
+    }
+
+    // ======== 主生成逻辑 ========
+    document.getElementById('clientBtnGrid').addEventListener('click', function(e) {
+        const btn = e.target.closest('.client-btn');
+        if (!btn) return;
+        const clientType = btn.dataset.client;
+        const clientName = btn.dataset.name;
+        if (nodeModeActive) {
+            generateNodeModeLink(clientType, clientName);
+        } else {
+            generateStandardLink(clientType, clientName);
+        }
+    });
+
+    // -- 标准模式 --
+    function generateStandardLink(clientType, clientName) {
+        const domain = document.getElementById('domain').value.trim();
+        const uuid = document.getElementById('uuid').value.trim();
+        if (!domain || !uuid) { alert('请先填写域名和 UUID/Password'); return; }
+        if (!switches.switchVL && !switches.switchTJ && !switches.switchVM) {
+            alert('请至少选择一个协议（VLESS / Trojan / VMess）'); return;
+        }
+        const customPath = document.getElementById('customPath').value.trim() || '/';
+        const ipUrls = getUrlsFromAttr('data-ip-url');
+        const domainUrls = getUrlsFromAttr('data-domain-url');
+        const base = window.location.origin;
+        let subUrl = \`\${base}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}\`
+            + \`&epd=\${switches.switchDomain?'yes':'no'}\`
+            + \`&epi=\${switches.switchIP?'yes':'no'}\`
+            + \`&egi=\${switches.switchGitHub?'yes':'no'}\`;
+        if (ipUrls.length) subUrl += \`&piuList=\${encodeURIComponent(ipUrls.join(','))}\`;
+        if (domainUrls.length) subUrl += \`&domainUrls=\${encodeURIComponent(domainUrls.join(','))}\`;
+        if (switches.switchVL) subUrl += '&ev=yes';
+        if (switches.switchTJ) subUrl += '&et=yes';
+        if (switches.switchVM) subUrl += '&mess=yes';
+        if (!document.getElementById('ipv4Enabled').checked) subUrl += '&ipv4=no';
+        if (!document.getElementById('ipv6Enabled').checked) subUrl += '&ipv6=no';
+        if (!document.getElementById('ispMobile').checked) subUrl += '&ispMobile=no';
+        if (!document.getElementById('ispUnicom').checked) subUrl += '&ispUnicom=no';
+        if (!document.getElementById('ispTelecom').checked) subUrl += '&ispTelecom=no';
+        if (switches.switchTLS) subUrl += '&dkby=yes';
+        if (switches.switchECH) {
+            subUrl += '&ech=yes';
+            const dns = document.getElementById('customDNS').value.trim();
+            const ech = document.getElementById('customECHDomain').value.trim();
+            if (dns) subUrl += \`&customDNS=\${encodeURIComponent(dns)}\`;
+            if (ech) subUrl += \`&customECHDomain=\${encodeURIComponent(ech)}\`;
+        }
+        if (customPath !== '/') subUrl += \`&path=\${encodeURIComponent(customPath)}\`;
+        dispatchClientLink(subUrl, clientType, clientName);
+    }
+
+    // -- 节点来源模式 --
+    function generateNodeModeLink(clientType, clientName) {
+        const manualText = document.getElementById('manualNodes').value.trim();
+        const nodeUrls = getUrlsFromAttr('data-node-url').filter(u => u.startsWith('http'));
+        const domainUrls = getUrlsFromAttr('data-domain-url');
+        const ipUrls = getUrlsFromAttr('data-ip-url');
+
+        // 收集手动节点
+        const manualLines = manualText
+            ? manualText.split('\\n').map(l=>l.trim()).filter(l=>
+                l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://'))
+            : [];
+
+        const base = window.location.origin;
+        let subUrl = \`\${base}/replace-sub?target=base64\`;
+
+        // 手动节点作为 base64
+        if (manualLines.length > 0) {
+            try {
+                const b64 = btoa(unescape(encodeURIComponent(manualLines.join('\\n'))));
+                subUrl += \`&nodes=\${encodeURIComponent(b64)}\`;
+            } catch(e) {}
+        }
+        // 订阅URL
+        if (nodeUrls.length > 0) {
+            subUrl += \`&nodeUrlList=\${encodeURIComponent(nodeUrls.join(','))}\`;
+        }
+        if (!manualLines.length && !nodeUrls.length) {
+            alert('请输入节点信息（URL 或手动粘贴）');
+            return;
+        }
+
+        // 共用参数
+        subUrl += \`&epd=\${switches.switchDomain?'yes':'no'}\`;
+        if (ipUrls.length) subUrl += \`&piuList=\${encodeURIComponent(ipUrls.join(','))}\`;
+        if (domainUrls.length) subUrl += \`&domainUrls=\${encodeURIComponent(domainUrls.join(','))}\`;
+        if (!document.getElementById('ipv4Enabled').checked) subUrl += '&ipv4=no';
+        if (!document.getElementById('ipv6Enabled').checked) subUrl += '&ipv6=no';
+        if (!document.getElementById('ispMobile').checked) subUrl += '&ispMobile=no';
+        if (!document.getElementById('ispUnicom').checked) subUrl += '&ispUnicom=no';
+        if (!document.getElementById('ispTelecom').checked) subUrl += '&ispTelecom=no';
+        if (switches.switchTLS) subUrl += '&dkby=yes';
+        if (!document.getElementById('replaceUseWetest')?.checked ?? false) subUrl += '&useWetest=no';
+
+        // 在节点模式下，对于 clash/stash/surge 等先用 base64 直链，再套订阅转换
+        let rawUrl = subUrl; // base64格式的直链
+        dispatchClientLink(rawUrl, clientType, clientName, true);
+    }
+
+    function dispatchClientLink(subUrl, clientType, clientName, isNodeMode = false) {
+        let finalUrl = subUrl;
+        let scheme = '';
+
+        if (clientType === 'v2ray') {
+            showSubUrl(finalUrl, isNodeMode);
+            if (clientName === 'V2RAY') {
+                copyAndAlert(finalUrl, clientName);
+            } else if (clientName === 'Shadowrocket') {
+                scheme = 'shadowrocket://add/' + encodeURIComponent(finalUrl);
+                tryOpenApp(scheme, () => copyAndAlert(finalUrl, clientName));
+            } else if (clientName === 'V2RAYNG') {
+                scheme = 'v2rayng://install?url=' + encodeURIComponent(finalUrl);
+                tryOpenApp(scheme, () => copyAndAlert(finalUrl, clientName));
+            } else if (clientName === 'NEKORAY') {
+                scheme = 'nekoray://install-config?url=' + encodeURIComponent(finalUrl);
+                tryOpenApp(scheme, () => copyAndAlert(finalUrl, clientName));
+            }
+        } else {
+            // 对于需要订阅转换的客户端，先把 subUrl 转为该格式
+            // 节点模式下 subUrl 已是 base64 endpoint
+            const targetParam = clientType;
+            finalUrl = SUB_CONVERTER_URL
+                + '?target=' + targetParam
+                + '&url=' + encodeURIComponent(subUrl)
+                + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
+            showSubUrl(finalUrl, isNodeMode);
+            if (clientType === 'clash') {
+                scheme = (clientName === 'STASH' ? 'stash://install?url=' : 'clash://install-config?url=') + encodeURIComponent(finalUrl);
+            } else if (clientType === 'surge') {
+                scheme = 'surge:///install-config?url=' + encodeURIComponent(finalUrl);
+            } else if (clientType === 'sing-box') {
+                scheme = 'sing-box://install-config?url=' + encodeURIComponent(finalUrl);
+            } else if (clientType === 'loon') {
+                scheme = 'loon://install?url=' + encodeURIComponent(finalUrl);
+            } else if (clientType === 'quanx') {
+                scheme = 'quantumult-x://install-config?url=' + encodeURIComponent(finalUrl);
+            }
+            if (scheme) {
+                tryOpenApp(scheme, () => copyAndAlert(finalUrl, clientName));
             } else {
-                item.querySelector('input').value = '';
+                copyAndAlert(finalUrl, clientName);
             }
         }
+    }
 
-        function addDomainUrl() {
-            const list = document.getElementById('domainUrlList');
-            const div = document.createElement('div');
-            div.className = 'url-list-item';
-            div.innerHTML = \`<input type="text" placeholder="输入包含优选域名列表的URL" data-domain-url>
-                <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>\`;
-            list.appendChild(div);
-            div.querySelector('input').focus();
-        }
-
-        function addIPUrl() {
-            const list = document.getElementById('ipUrlList');
-            const div = document.createElement('div');
-            div.className = 'url-list-item';
-            div.innerHTML = \`<input type="text" placeholder="输入优选IP来源URL" data-ip-url>
-                <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>\`;
-            list.appendChild(div);
-            div.querySelector('input').focus();
-        }
-
-        function addReplaceIPUrl() {
-            const list = document.getElementById('replaceIPUrlList');
-            const div = document.createElement('div');
-            div.className = 'url-list-item';
-            div.innerHTML = \`<input type="text" placeholder="输入优选IP列表URL" data-replace-ip-url>
-                <button class="remove-btn" onclick="removeUrlItem(this)" title="删除">×</button>\`;
-            list.appendChild(div);
-            div.querySelector('input').focus();
-        }
-
-        function getUrlsFromList(selector) {
-            return Array.from(document.querySelectorAll(selector))
-                .map(i => i.value.trim())
-                .filter(v => v.length > 0);
-        }
-        
-        // 订阅转换地址（从服务器注入）
-        const SUB_CONVERTER_URL = "${ scu }";
-        
-        function tryOpenApp(schemeUrl, fallbackCallback, timeout) {
-            timeout = timeout || 2500;
-            let appOpened = false;
-            let callbackExecuted = false;
-            const startTime = Date.now();
-            
-            const blurHandler = () => {
-                const elapsed = Date.now() - startTime;
-                if (elapsed < 3000 && !callbackExecuted) {
-                    appOpened = true;
-                }
-            };
-            
-            window.addEventListener('blur', blurHandler);
-            
-            const hiddenHandler = () => {
-                const elapsed = Date.now() - startTime;
-                if (elapsed < 3000 && !callbackExecuted) {
-                    appOpened = true;
-                }
-            };
-            
-            document.addEventListener('visibilitychange', hiddenHandler);
-            
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.style.width = '1px';
-            iframe.style.height = '1px';
-            iframe.src = schemeUrl;
-            document.body.appendChild(iframe);
-            
-            setTimeout(() => {
-                if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-                window.removeEventListener('blur', blurHandler);
-                document.removeEventListener('visibilitychange', hiddenHandler);
-                
-                if (!callbackExecuted) {
-                    callbackExecuted = true;
-                    if (!appOpened && fallbackCallback) {
-                        fallbackCallback();
-                    }
-                }
-            }, timeout);
-        }
-        
-        function generateClientLink(clientType, clientName) {
-            const domain = document.getElementById('domain').value.trim();
-            const uuid = document.getElementById('uuid').value.trim();
-            const customPath = document.getElementById('customPath').value.trim() || '/';
-            
-            if (!domain || !uuid) {
-                alert('请先填写域名和UUID/Password');
-                return;
-            }
-            
-            if (!switches.switchVL && !switches.switchTJ && !switches.switchVM) {
-                alert('请至少选择一个协议（VLESS、Trojan或VMess）');
-                return;
-            }
-            
-            const ipv4Enabled = document.getElementById('ipv4Enabled').checked;
-            const ipv6Enabled = document.getElementById('ipv6Enabled').checked;
-            const ispMobile = document.getElementById('ispMobile').checked;
-            const ispUnicom = document.getElementById('ispUnicom').checked;
-            const ispTelecom = document.getElementById('ispTelecom').checked;
-            
-            // 新功能3：多个IP URL
-            const ipUrls = getUrlsFromList('[data-ip-url]');
-            // 新功能2：多个域名URL
-            const domainUrls = getUrlsFromList('[data-domain-url]');
-            
-            const currentUrl = new URL(window.location.href);
-            const baseUrl = currentUrl.origin;
-            let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}\`;
-            
-            // 添加多个IP URL（新功能3）
-            if (ipUrls.length > 0) {
-                subscriptionUrl += \`&piuList=\${encodeURIComponent(ipUrls.join(','))}\`;
-            }
-            
-            // 添加多个域名URL（新功能2）
-            if (domainUrls.length > 0) {
-                subscriptionUrl += \`&domainUrls=\${encodeURIComponent(domainUrls.join(','))}\`;
-            }
-            
-            if (switches.switchVL) subscriptionUrl += '&ev=yes';
-            if (switches.switchTJ) subscriptionUrl += '&et=yes';
-            if (switches.switchVM) subscriptionUrl += '&mess=yes';
-            
-            if (!ipv4Enabled) subscriptionUrl += '&ipv4=no';
-            if (!ipv6Enabled) subscriptionUrl += '&ipv6=no';
-            if (!ispMobile) subscriptionUrl += '&ispMobile=no';
-            if (!ispUnicom) subscriptionUrl += '&ispUnicom=no';
-            if (!ispTelecom) subscriptionUrl += '&ispTelecom=no';
-            
-            if (switches.switchTLS) subscriptionUrl += '&dkby=yes';
-            if (switches.switchECH) {
-                subscriptionUrl += '&ech=yes';
-                const dnsVal = document.getElementById('customDNS') && document.getElementById('customDNS').value.trim();
-                if (dnsVal) subscriptionUrl += \`&customDNS=\${encodeURIComponent(dnsVal)}\`;
-                const domainVal = document.getElementById('customECHDomain') && document.getElementById('customECHDomain').value.trim();
-                if (domainVal) subscriptionUrl += \`&customECHDomain=\${encodeURIComponent(domainVal)}\`;
-            }
-            
-            if (customPath && customPath !== '/') {
-                subscriptionUrl += \`&path=\${encodeURIComponent(customPath)}\`;
-            }
-            
-            let finalUrl = subscriptionUrl;
-            let schemeUrl = '';
-            let displayName = clientName || '';
-            
-            if (clientType === 'v2ray') {
-                finalUrl = subscriptionUrl;
-                const urlElement = document.getElementById('clientSubscriptionUrl');
-                urlElement.textContent = finalUrl;
-                urlElement.style.display = 'block';
-                
-                if (clientName === 'V2RAY') {
-                    navigator.clipboard.writeText(finalUrl).then(() => {
-                        alert(displayName + ' 订阅链接已复制');
-                    });
-                } else if (clientName === 'Shadowrocket') {
-                    schemeUrl = 'shadowrocket://add/' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else if (clientName === 'V2RAYNG') {
-                    schemeUrl = 'v2rayng://install?url=' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else if (clientName === 'NEKORAY') {
-                    schemeUrl = 'nekoray://install-config?url=' + encodeURIComponent(finalUrl);
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                }
-            } else {
-                const encodedUrl = encodeURIComponent(subscriptionUrl);
-                finalUrl = SUB_CONVERTER_URL + '?target=' + clientType + '&url=' + encodedUrl + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
-                
-                const urlElement = document.getElementById('clientSubscriptionUrl');
-                urlElement.textContent = finalUrl;
-                urlElement.style.display = 'block';
-                
-                if (clientType === 'clash') {
-                    if (clientName === 'STASH') {
-                        schemeUrl = 'stash://install?url=' + encodeURIComponent(finalUrl);
-                        displayName = 'STASH';
-                    } else {
-                        schemeUrl = 'clash://install-config?url=' + encodeURIComponent(finalUrl);
-                        displayName = 'CLASH';
-                    }
-                } else if (clientType === 'surge') {
-                    schemeUrl = 'surge:///install-config?url=' + encodeURIComponent(finalUrl);
-                } else if (clientType === 'sing-box') {
-                    schemeUrl = 'sing-box://install-config?url=' + encodeURIComponent(finalUrl);
-                } else if (clientType === 'loon') {
-                    schemeUrl = 'loon://install?url=' + encodeURIComponent(finalUrl);
-                } else if (clientType === 'quanx') {
-                    schemeUrl = 'quantumult-x://install-config?url=' + encodeURIComponent(finalUrl);
-                }
-                
-                if (schemeUrl) {
-                    tryOpenApp(schemeUrl, () => {
-                        navigator.clipboard.writeText(finalUrl).then(() => {
-                            alert(displayName + ' 订阅链接已复制');
-                        });
-                    });
-                } else {
-                    navigator.clipboard.writeText(finalUrl).then(() => {
-                        alert(displayName + ' 订阅链接已复制');
-                    });
-                }
-            }
-        }
-
-        // ============ 新功能1：节点IP替换订阅生成 ============
-        function generateReplaceSubLink(targetFormat, clientName) {
-            const nodesText = document.getElementById('replaceNodes').value.trim();
-            if (!nodesText) {
-                alert('请先粘贴需要替换IP的原始节点列表');
-                return;
-            }
-            
-            const lines = nodesText.split('\\n').map(l => l.trim()).filter(l => l && (
-                l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://')
-            ));
-            
-            if (lines.length === 0) {
-                alert('未找到有效节点，请确认格式为 vless:// / trojan:// / vmess://');
-                return;
-            }
-
-            // Base64编码节点
-            const nodesB64 = btoa(unescape(encodeURIComponent(lines.join('\\n'))));
-            
-            const ipUrls = getUrlsFromList('[data-replace-ip-url]');
-            const ipv4 = document.getElementById('replaceIPv4').checked;
-            const ipv6 = document.getElementById('replaceIPv6').checked;
-            const mobile = document.getElementById('replaceMobile').checked;
-            const unicom = document.getElementById('replaceUnicom').checked;
-            const telecom = document.getElementById('replaceTelecom').checked;
-            const useWetest = document.getElementById('replaceUseWetest').checked;
-            
-            const currentUrl = new URL(window.location.href);
-            let subUrl = \`\${currentUrl.origin}/replace-sub?nodes=\${encodeURIComponent(nodesB64)}&target=\${targetFormat}\`;
-            
-            if (ipUrls.length > 0) {
-                subUrl += \`&piuList=\${encodeURIComponent(ipUrls.join(','))}\`;
-            }
-            if (!ipv4) subUrl += '&ipv4=no';
-            if (!ipv6) subUrl += '&ipv6=no';
-            if (!mobile) subUrl += '&ispMobile=no';
-            if (!unicom) subUrl += '&ispUnicom=no';
-            if (!telecom) subUrl += '&ispTelecom=no';
-            if (!useWetest) subUrl += '&useWetest=no';
-            
-            let finalUrl = subUrl;
-            if (targetFormat === 'clash' && clientName !== 'CLASH') {
-                // 仍通过订阅转换器
-                finalUrl = SUB_CONVERTER_URL + '?target=clash&url=' + encodeURIComponent(subUrl) + '&insert=false&emoji=true&list=false&expand=true&scv=false&fdn=false&new_name=true';
-            }
-
-            const urlElement = document.getElementById('replaceSubUrl');
-            urlElement.textContent = finalUrl;
-            urlElement.style.display = 'block';
-            
-            let schemeUrl = '';
-            if (clientName === 'Shadowrocket') {
-                schemeUrl = 'shadowrocket://add/' + encodeURIComponent(finalUrl);
-            } else if (clientName === 'CLASH') {
-                schemeUrl = 'clash://install-config?url=' + encodeURIComponent(finalUrl);
-            } else if (clientName === 'STASH') {
-                schemeUrl = 'stash://install?url=' + encodeURIComponent(finalUrl);
-            }
-
-            if (schemeUrl) {
-                tryOpenApp(schemeUrl, () => {
-                    navigator.clipboard.writeText(finalUrl).then(() => {
-                        alert(clientName + ' 订阅链接已复制');
-                    });
-                });
-            } else {
-                navigator.clipboard.writeText(finalUrl).then(() => {
-                    alert(clientName + ' 订阅链接已复制');
-                });
-            }
-        }
-    </script>
+    function showSubUrl(url, isNodeMode) {
+        const el = document.getElementById('subUrlDisplay');
+        el.textContent = url;
+        el.style.display = 'block';
+        el.className = 'result-url' + (isNodeMode ? ' purple' : '');
+    }
+</script>
 </body>
 </html>`;
 }
@@ -2177,8 +1830,8 @@ export default {
         }
 
         // ============================================================
-        // 新功能1：节点IP替换订阅端点 /replace-sub?nodes=BASE64&piuList=URL1,URL2...
-        // ============================================================
+        // 节点IP替换订阅端点 /replace-sub
+        // 参数: nodes(base64), nodeUrlList(URL逗号分隔), piuList, epd, domainUrls, dkby, ipv4/6, isp...
         if (path === '/replace-sub') {
             if (request.method === 'OPTIONS') {
                 return new Response(null, {
@@ -2190,18 +1843,54 @@ export default {
                 });
             }
             
-            const nodesB64 = url.searchParams.get('nodes');
-            if (!nodesB64) {
-                return new Response('缺少nodes参数', { status: 400 });
+            const nodesB64 = url.searchParams.get('nodes') || null;
+
+            // 支持多个订阅URL（nodeUrlList 逗号分隔）
+            const nodeUrlListStr = url.searchParams.get('nodeUrlList');
+            if (nodeUrlListStr) {
+                // 传给 handleReplaceIPSubscription 通过 nodeUrl 参数处理
+                // 这里把多个URL合并到请求中处理
             }
             
-            // 解析多URL（新功能3复用）
+            if (!nodesB64 && !url.searchParams.get('nodeUrlList')) {
+                return new Response('缺少 nodes 或 nodeUrlList 参数', { status: 400 });
+            }
+
+            // 先把多个nodeUrl的节点全部拉取并合并成一个base64
+            let combinedNodesB64 = nodesB64;
+            if (nodeUrlListStr) {
+                const nodeUrls = nodeUrlListStr.split(',').map(u => u.trim()).filter(u => u.startsWith('http'));
+                const fetchedAll = [];
+                for (const nu of nodeUrls) {
+                    const fetched = await fetchNodesFromURL(nu);
+                    fetchedAll.push(...fetched);
+                }
+                if (fetchedAll.length > 0) {
+                    let extra = '';
+                    try { extra = btoa(unescape(encodeURIComponent(fetchedAll.join('\n')))); } catch(e) {}
+                    if (combinedNodesB64 && extra) {
+                        // 解码合并再编码
+                        try {
+                            const existing = atob(combinedNodesB64).split('\n').filter(l=>l);
+                            const all = [...existing, ...fetchedAll];
+                            combinedNodesB64 = btoa(unescape(encodeURIComponent([...new Set(all)].join('\n'))));
+                        } catch(e) { combinedNodesB64 = extra; }
+                    } else {
+                        combinedNodesB64 = extra;
+                    }
+                }
+            }
+
+            if (!combinedNodesB64) {
+                return new Response('未能获取到有效节点数据', { status: 400 });
+            }
+            
             const piuListStr = url.searchParams.get('piuList');
             const ipSources = piuListStr
                 ? piuListStr.split(',').map(u => u.trim()).filter(u => u.startsWith('http'))
                 : [];
             
-            return await handleReplaceIPSubscription(request, null, nodesB64, ipSources, 30);
+            return await handleReplaceIPSubscription(request, null, combinedNodesB64, ipSources, 30);
         }
 
         // ============================================================
