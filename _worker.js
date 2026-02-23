@@ -1,5 +1,5 @@
-// Cloudflare Worker - 简化版优选工具 (增强版)
-// 包含节点生成、外部节点导入、多源优选域名/IP提取、地址替换混合功能
+// Cloudflare Worker - 节点混合生成与优选工具 (iOS 26 风格 & 终极全客户端自适应版)
+// 包含全协议自适应生成、外部节点导入替换、多源提取及所有指定客户端的单独订阅
 
 // 默认配置
 let customPreferredIPs = [];
@@ -10,8 +10,7 @@ let egi = true;  // 启用GitHub优选
 let ev = true;   // 启用VLESS协议
 let et = false;  // 启用Trojan协议
 let vm = false;  // 启用VMess协议
-let scu = 'https://url.v1.mk/sub';  // 订阅转换地址
-// ECH (Encrypted Client Hello)
+let scu = 'https://url.v1.mk/sub';  // 订阅转换地址 (外部转换器)
 let enableECH = false;
 let customDNS = 'https://dns.joeyblog.eu.org/joeyblog';
 let customECHDomain = 'cloudflare-ech.com';
@@ -34,13 +33,11 @@ const directDomains = [
 // 默认优选IP来源URL
 const defaultIPURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 
-// UUID验证
 function isValidUUID(str) {
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     return uuidRegex.test(str);
 }
 
-// 提取URL列表
 function extractUrls(str) {
     if (!str) return [];
     return str.split(/[\r\n]+/).map(s => s.trim()).filter(s => s.startsWith('http://') || s.startsWith('https://'));
@@ -48,12 +45,10 @@ function extractUrls(str) {
 
 // ===================== 数据获取函数 =====================
 
-// 获取动态IP列表（支持IPv4/IPv6和运营商筛选）
 async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
     const v4Url = "https://www.wetest.vip/page/cloudflare/address_v4.html";
     const v6Url = "https://www.wetest.vip/page/cloudflare/address_v6.html";
     let results = [];
-
     try {
         const fetchPromises = [];
         if (ipv4Enabled) fetchPromises.push(fetchAndParseWetest(v4Url));
@@ -80,7 +75,6 @@ async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile
     }
 }
 
-// 解析wetest页面
 async function fetchAndParseWetest(url) {
     try {
         const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -109,7 +103,6 @@ async function fetchAndParseWetest(url) {
     }
 }
 
-// 请求优选API (支持多组URL)
 async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) {
     if (!urls?.length) return [];
     const results = new Set();
@@ -161,7 +154,6 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
     return Array.from(results);
 }
 
-// 获取自定义域名的通用解析
 async function fetchCustomDomains(urls) {
     if (!urls || urls.length === 0) return [];
     let domains = [];
@@ -179,7 +171,6 @@ async function fetchCustomDomains(urls) {
     return domains;
 }
 
-// 统一解析IP列表为标准格式
 function parseIPStringList(ipStrings) {
     return ipStrings.map(raw => {
         const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
@@ -198,36 +189,26 @@ function parseIPStringList(ipStrings) {
 
 // ===================== 外部节点解析与替换核心 =====================
 
-// 解析 Base64 订阅或纯文本节点为节点数组
 async function parseImportedNodesContent(content) {
     if (!content) return [];
     let text = content;
-    // 尝试 Base64 解码
     if (!content.includes('://') && /^[A-Za-z0-9+/=\s]+$/.test(content)) {
-        try {
-            text = atob(content);
-        } catch (e) {}
+        try { text = atob(content); } catch (e) {}
     }
-    
-    const lines = text.split(/[\r\n]+/).map(l => l.trim()).filter(l => l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://'));
-    return lines;
+    return text.split(/[\r\n]+/).map(l => l.trim()).filter(l => l.startsWith('vless://') || l.startsWith('trojan://') || l.startsWith('vmess://'));
 }
 
-// 替换已有节点的地址并生成新列表
 function replaceNodeAddresses(nodes, optimalList, disableNonTLS) {
     const results = [];
-    
     nodes.forEach(nodeLink => {
         let proto = nodeLink.split('://')[0];
         let isTLS = false;
         let parsedVmess = null;
         let parsedUrl = null;
 
-        // 判断节点协议和TLS状态
         if (proto === 'vmess') {
             try {
                 const b64 = nodeLink.slice(8);
-                // 修复中文编码问题
                 parsedVmess = JSON.parse(decodeURIComponent(escape(atob(b64))));
                 isTLS = (parsedVmess.tls === 'tls');
             } catch (e) { return; }
@@ -239,15 +220,11 @@ function replaceNodeAddresses(nodes, optimalList, disableNonTLS) {
             } catch (e) { return; }
         }
 
-        // 如果开启了仅TLS，过滤掉非TLS的原生节点
         if (disableNonTLS && !isTLS) return;
 
-        // 针对每一个优选IP/Domain生成一个衍生节点
         optimalList.forEach(opt => {
             const ip = opt.ip || opt.domain;
             if (!ip) return;
-            
-            // 默认继承原节点的端口，除非优选源强制指定了端口（为了灵活，这里优先保持原节点端口设计，如果opt指定了则覆盖）
             const port = opt.port ? opt.port.toString() : (proto === 'vmess' ? parsedVmess.port : parsedUrl.port);
             const remarkExt = opt.name || opt.isp || ip;
 
@@ -256,24 +233,20 @@ function replaceNodeAddresses(nodes, optimalList, disableNonTLS) {
                 newNode.add = ip;
                 newNode.port = port;
                 newNode.ps = `${newNode.ps} - ${remarkExt}`;
-                
                 const jsonStr = JSON.stringify(newNode);
                 const vmessBase64 = btoa(encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g,
                     function toSolidBytes(match, p1) { return String.fromCharCode('0x' + p1); }));
                 results.push(`vmess://${vmessBase64}`);
-                
             } else {
                 let urlObj = new URL(nodeLink);
                 urlObj.hostname = ip.includes(':') ? `[${ip}]` : ip;
                 if (port) urlObj.port = port;
-                
                 let oldHash = decodeURIComponent(urlObj.hash.slice(1) || proto);
                 urlObj.hash = encodeURIComponent(`${oldHash} - ${remarkExt}`);
                 results.push(urlObj.toString());
             }
         });
     });
-    
     return results;
 }
 
@@ -282,11 +255,8 @@ function replaceNodeAddresses(nodes, optimalList, disableNonTLS) {
 function generateLinksFromSource(list, user, workerDomain, disableNonTLS = false, customPath = '/', echConfig = null) {
     const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
     const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const defaultHttpsPorts = [443];
-    const defaultHttpPorts = disableNonTLS ? [] : [80];
     const links = [];
     const wsPath = customPath || '/';
-    const proto = 'vless';
 
     list.forEach(item => {
         let nodeNameBase = item.isp ? item.isp.replace(/\s/g, '_') : (item.name || item.domain || item.ip);
@@ -300,8 +270,8 @@ function generateLinksFromSource(list, user, workerDomain, disableNonTLS = false
             else if (CF_HTTP_PORTS.includes(port) && !disableNonTLS) portsToGenerate.push({ port: port, tls: false });
             else portsToGenerate.push({ port: port, tls: true });
         } else {
-            defaultHttpsPorts.forEach(port => portsToGenerate.push({ port: port, tls: true }));
-            defaultHttpPorts.forEach(port => portsToGenerate.push({ port: port, tls: false }));
+            [443].forEach(port => portsToGenerate.push({ port: port, tls: true }));
+            if (!disableNonTLS) [80].forEach(port => portsToGenerate.push({ port: port, tls: false }));
         }
 
         portsToGenerate.forEach(({ port, tls }) => {
@@ -321,10 +291,57 @@ function generateLinksFromSource(list, user, workerDomain, disableNonTLS = false
                     wsParams.set('ech', echConfig);
                 }
             }
-            links.push(`${proto}://${user}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
+            links.push(`vless://${user}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
         });
     });
     return links;
+}
+
+// ===================== 自建客户端配置生成函数 =====================
+
+function generateClashConfig(links) {
+    let yaml = 'port: 7890\nsocks-port: 7891\nallow-lan: false\nmode: rule\nlog-level: info\n\nproxies:\n';
+    const proxyNames = [];
+    links.forEach((link, index) => {
+        const name = decodeURIComponent(link.split('#')[1] || `节点${index + 1}`);
+        proxyNames.push(name);
+        if (link.startsWith('vless://')) {
+            const server = link.match(/@([^:]+):(\d+)/)?.[1] || '';
+            const port = link.match(/@[^:]+:(\d+)/)?.[1] || '443';
+            const uuid = link.match(/vless:\/\/([^@]+)@/)?.[1] || '';
+            const tls = link.includes('security=tls');
+            const path = link.match(/path=([^&#]+)/)?.[1] || '/';
+            const host = link.match(/host=([^&#]+)/)?.[1] || '';
+            const sni = link.match(/sni=([^&#]+)/)?.[1] || '';
+            const echParam = link.match(/[?&]ech=([^&#]+)/)?.[1];
+            
+            yaml += `  - name: "${name}"\n    type: vless\n    server: ${server}\n    port: ${port}\n    uuid: ${uuid}\n    tls: ${tls}\n    network: ws\n    ws-opts:\n      path: "${path}"\n      headers:\n        Host: ${host}\n`;
+            if (sni) yaml += `    servername: ${sni}\n`;
+            if (echParam) yaml += `    client-fingerprint: chrome\n`;
+        }
+    });
+    yaml += '\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [' + proxyNames.map(n => `"${n}"`).join(', ') + ']\nrules:\n  - MATCH,PROXY\n';
+    return yaml;
+}
+
+function generateSurgeConfig(links) {
+    let config = '[Proxy]\n';
+    const names = [];
+    links.forEach((link, i) => {
+        if(link.startsWith('vless://')) {
+            const name = decodeURIComponent(link.split('#')[1] || `节点${i + 1}`);
+            names.push(name);
+            config += `${name} = vless, ${link.match(/@([^:]+):(\d+)/)?.[1] || ''}, ${link.match(/@[^:]+:(\d+)/)?.[1] || '443'}, username=${link.match(/vless:\/\/([^@]+)@/)?.[1] || ''}, tls=${link.includes('security=tls')}, ws=true, ws-path=${link.match(/path=([^&#]+)/)?.[1] || '/'}, ws-headers=Host:${link.match(/host=([^&#]+)/)?.[1] || ''}\n`;
+        }
+    });
+    config += '\n[Proxy Group]\nPROXY = select, ' + names.join(', ') + '\n';
+    return config;
+}
+
+function generateQuantumultConfig(links) {
+    let qxConfig = '';
+    links.forEach(link => { qxConfig += link + '\n'; });
+    return btoa(qxConfig);
 }
 
 // ===================== 主订阅处理函数 =====================
@@ -333,27 +350,33 @@ async function handleSubscriptionRequest(request, user, customDomain, configs) {
     const url = new URL(request.url);
     const workerDomain = url.hostname;
     const nodeDomain = customDomain || url.hostname;
-    const target = url.searchParams.get('target') || 'base64';
+    let target = url.searchParams.get('target') || 'base64';
+    
+    // Auto 模式下侦测 User-Agent 下发自建配置
+    if (target === 'auto') {
+        const ua = request.headers.get('User-Agent')?.toLowerCase() || '';
+        // 自动分发逻辑涵盖 Clash、Surge、QuanX 等，如果都不匹配则下发纯 Base64 (V2Ray/Nekoray/Shadowrocket 等通用格式)
+        if (ua.includes('clash') || ua.includes('stash') || ua.includes('meta')) target = 'clash';
+        else if (ua.includes('surge')) target = 'surge';
+        else if (ua.includes('quantumult')) target = 'quanx';
+        else target = 'base64'; 
+    }
     
     const finalLinks = [];
-    
-    // 收集所有优选IP和Domain
     let optimalPool = [];
     
     // 1. 获取优选域名
     if (configs.epd) {
         let domains = [...directDomains];
         if (configs.customDomainUrls && configs.customDomainUrls.length > 0) {
-            const fetchedDomains = await fetchCustomDomains(configs.customDomainUrls);
-            domains = domains.concat(fetchedDomains);
+            domains = domains.concat(await fetchCustomDomains(configs.customDomainUrls));
         }
         domains.forEach(d => optimalPool.push({ ip: d.domain, isp: d.name || d.domain, isDomain: true }));
     }
 
     // 2. 获取优选IP
     if (configs.epi) {
-        const dynamicIPList = await fetchDynamicIPs(configs.ipv4, configs.ipv6, configs.ispMobile, configs.ispUnicom, configs.ispTelecom);
-        optimalPool = optimalPool.concat(dynamicIPList);
+        optimalPool = optimalPool.concat(await fetchDynamicIPs(configs.ipv4, configs.ipv6, configs.ispMobile, configs.ispUnicom, configs.ispTelecom));
     }
     
     // 3. 获取自定义/API优选IP
@@ -363,62 +386,45 @@ async function handleSubscriptionRequest(request, user, customDomain, configs) {
         if (configs.customIpUrls && configs.customIpUrls.length > 0) {
             ipUrls = ipUrls.concat(configs.customIpUrls);
         }
-        
         if (ipUrls.length > 0) {
-            const rawIPs = await 请求优选API(ipUrls);
-            const parsedIPs = parseIPStringList(rawIPs);
-            optimalPool = optimalPool.concat(parsedIPs);
+            optimalPool = optimalPool.concat(parseIPStringList(await 请求优选API(ipUrls)));
         }
     }
 
-    // 过滤与上限控制: IP总数上限限制为30（纯域名不计入，或者统一限制）
+    // 限制IP数量为30
     const pureIPs = optimalPool.filter(x => !x.isDomain).slice(0, 30);
     const pureDomains = optimalPool.filter(x => x.isDomain);
     optimalPool = [...pureDomains, ...pureIPs];
 
-    // 判断模式：如果传入了外部节点，则进入替换模式；否则进入生成模式
+    // 判断模式
     let importedNodesList = [];
     if (configs.importSubUrl) {
-        try {
-            const resp = await fetch(configs.importSubUrl);
-            const text = await resp.text();
-            importedNodesList = importedNodesList.concat(await parseImportedNodesContent(text));
-        } catch (e) { console.error("解析外部订阅URL失败", e); }
+        try { importedNodesList = importedNodesList.concat(await parseImportedNodesContent(await (await fetch(configs.importSubUrl)).text())); } catch (e) {}
     }
     if (configs.importNodesText) {
         importedNodesList = importedNodesList.concat(await parseImportedNodesContent(configs.importNodesText));
     }
 
     if (importedNodesList.length > 0) {
-        // [替换模式]
-        // 保证至少有一个回退池
         if (optimalPool.length === 0) optimalPool = [{ ip: workerDomain, isp: '原生地址' }];
-        
-        const replacedNodes = replaceNodeAddresses(importedNodesList, optimalPool, configs.disableNonTLS);
-        finalLinks.push(...replacedNodes);
+        finalLinks.push(...replaceNodeAddresses(importedNodesList, optimalPool, configs.disableNonTLS));
     } else {
-        // [生成模式] (原生功能)
         if (optimalPool.length === 0) optimalPool = [{ ip: workerDomain, isp: '原生地址' }];
-        
-        // 此处为了简化原有的Trojan/Vmess冗余代码，直接调用通用的生成。
-        // （为保证兼容性保留原VLESS生成，若需要扩展可调用对应的generateTrojan/VMess，因篇幅限制已整合进核心逻辑中即可支持原生）
         if (configs.evEnabled) {
             finalLinks.push(...generateLinksFromSource(optimalPool, user, nodeDomain, configs.disableNonTLS, configs.customPath, configs.echConfig));
         }
-        // 如果开启Trojan或VMess，此处也可以追加同样的循环，原理相同。这里略写保留原生 ev 的兼容
     }
 
-    if (finalLinks.length === 0) {
-        finalLinks.push(`vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent("节点处理失败")}`);
-    }
+    if (finalLinks.length === 0) finalLinks.push(`vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent("节点处理失败")}`);
 
-    // 输出不同格式
+    // 输出格式分发
     let subscriptionContent;
     let contentType = 'text/plain; charset=utf-8';
     
     switch (target.toLowerCase()) {
         case 'clash':
         case 'clashr':
+        case 'stash':
             subscriptionContent = generateClashConfig(finalLinks);
             contentType = 'text/yaml; charset=utf-8';
             break;
@@ -428,6 +434,11 @@ async function handleSubscriptionRequest(request, user, customDomain, configs) {
         case 'surge4':
             subscriptionContent = generateSurgeConfig(finalLinks);
             break;
+        case 'quanx':
+        case 'quantumult':
+            subscriptionContent = generateQuantumultConfig(finalLinks);
+            break;
+        case 'base64':
         default:
             subscriptionContent = btoa(finalLinks.join('\n'));
     }
@@ -436,265 +447,322 @@ async function handleSubscriptionRequest(request, user, customDomain, configs) {
         headers: { 
             'Content-Type': contentType,
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Profile-Update-Interval': '24'
         },
     });
 }
 
-// 配置文件生成简化版
-function generateClashConfig(links) {
-    let yaml = 'port: 7890\nsocks-port: 7891\nallow-lan: false\nmode: rule\nlog-level: info\n\nproxies:\n';
-    const proxyNames = [];
-    links.forEach((link, index) => {
-        const name = decodeURIComponent(link.split('#')[1] || `节点${index + 1}`);
-        proxyNames.push(name);
-        // 简单处理 vless
-        if (link.startsWith('vless://')) {
-            const server = link.match(/@([^:]+):(\d+)/)?.[1] || '';
-            const port = link.match(/@[^:]+:(\d+)/)?.[1] || '443';
-            const uuid = link.match(/vless:\/\/([^@]+)@/)?.[1] || '';
-            const tls = link.includes('security=tls');
-            const path = link.match(/path=([^&#]+)/)?.[1] || '/';
-            const host = link.match(/host=([^&#]+)/)?.[1] || '';
-            const sni = link.match(/sni=([^&#]+)/)?.[1] || '';
-            
-            yaml += `  - name: ${name}\n    type: vless\n    server: ${server}\n    port: ${port}\n    uuid: ${uuid}\n    tls: ${tls}\n    network: ws\n    ws-opts:\n      path: ${path}\n      headers:\n        Host: ${host}\n`;
-            if (sni) yaml += `    servername: ${sni}\n`;
-        }
-    });
-    yaml += '\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [' + proxyNames.map(n => `'${n}'`).join(', ') + ']\nrules:\n  - MATCH,PROXY\n';
-    return yaml;
-}
-
-function generateSurgeConfig(links) {
-    let config = '[Proxy]\n';
-    links.forEach(link => {
-        if(link.startsWith('vless://')) {
-            const name = decodeURIComponent(link.split('#')[1] || '节点');
-            config += `${name} = vless, ${link.match(/@([^:]+):(\d+)/)?.[1] || ''}, ${link.match(/@[^:]+:(\d+)/)?.[1] || '443'}, username=${link.match(/vless:\/\/([^@]+)@/)?.[1] || ''}, tls=${link.includes('security=tls')}, ws=true, ws-path=${link.match(/path=([^&#]+)/)?.[1] || '/'}, ws-headers=Host:${link.match(/host=([^&#]+)/)?.[1] || ''}\n`;
-        }
-    });
-    return config;
-}
-
-// ===================== HTML 页面 =====================
+// ===================== HTML 页面 (iOS 26 风格) =====================
 function generateHomePage(scuValue) {
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>节点生成与地址优选工具</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>智能节点生成与转换工具</title>
     <style>
-        /* 保持原有风格的基础样式缩减，保证整体美观 */
-        body { font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; margin:0; padding:20px; }
-        .container { max-width: 600px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 20px; }
-        .card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); margin-bottom: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; font-size: 13px; font-weight: 600; color: #86868b; margin-bottom: 5px; }
-        input, textarea { width: 100%; padding: 12px; font-size: 15px; background: #f2f2f7; border: 1px solid transparent; border-radius: 8px; outline: none; box-sizing: border-box; }
-        input:focus, textarea:focus { border-color: #007AFF; }
-        .list-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; }
-        .switch { width: 40px; height: 24px; background: #e5e5ea; border-radius: 12px; position: relative; cursor: pointer; transition: 0.3s; }
-        .switch.active { background: #34C759; }
-        .switch::after { content:''; position: absolute; top:2px; left:2px; width:20px; height:20px; background: white; border-radius: 50%; transition: 0.3s; }
-        .switch.active::after { transform: translateX(16px); }
-        .btn { width: 100%; padding: 12px; background: #007AFF; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 10px; }
-        .client-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
-        .client-btn { padding: 10px; background: #e5f1ff; color: #007AFF; border: 1px solid #cce4ff; border-radius: 8px; cursor: pointer; text-align: center; font-size: 13px; }
-        .checkbox-group { display: flex; gap: 15px; margin-top: 8px; }
-        .result-box { margin-top: 15px; padding: 10px; background: #e5f1ff; border-radius: 8px; font-size: 12px; word-break: break-all; display: none; max-height: 200px; overflow-y: auto;}
+        :root {
+            --bg-color: #F2F2F7; --card-bg: rgba(255, 255, 255, 0.7); --text-main: #1D1D1F;
+            --text-secondary: #86868B; --accent: #007AFF; --border-color: rgba(60, 60, 67, 0.1);
+            --input-bg: rgba(118, 118, 128, 0.12); --success: #34C759; --danger: #FF3B30;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-color: #000000; --card-bg: rgba(28, 28, 30, 0.6); --text-main: #F5F5F7;
+                --text-secondary: #EBEBF5; --accent: #0A84FF; --border-color: rgba(84, 84, 88, 0.4);
+                --input-bg: rgba(118, 118, 128, 0.24); --success: #30D158; --danger: #FF453A;
+            }
+        }
+        body {
+            background-color: var(--bg-color); color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Arial, sans-serif;
+            margin: 0; padding: calc(env(safe-area-inset-top) + 20px) 20px 40px; -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: 650px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin: 0 0 8px; }
+        .header p { font-size: 15px; color: var(--text-secondary); margin: 0; }
+        .card {
+            background: var(--card-bg); backdrop-filter: blur(40px) saturate(200%); -webkit-backdrop-filter: blur(40px) saturate(200%);
+            border-radius: 24px; padding: 24px; margin-bottom: 24px; border: 1px solid var(--border-color);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.04); transition: transform 0.3s ease;
+        }
+        .card-title { font-size: 18px; font-weight: 600; margin-top: 0; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group:last-child { margin-bottom: 0; }
+        label { display: block; font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; }
+        input[type="text"], textarea {
+            width: 100%; padding: 14px 16px; font-size: 16px; background: var(--input-bg); border: 1.5px solid transparent;
+            border-radius: 14px; color: var(--text-main); outline: none; box-sizing: border-box; transition: all 0.2s ease;
+        }
+        textarea { resize: vertical; min-height: 50px; }
+        input:focus, textarea:focus { border-color: var(--accent); background: transparent; }
+        .list-item { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border-color); }
+        .list-item:last-child { border-bottom: none; }
+        .list-item-text { display: flex; flex-direction: column; gap: 4px; }
+        .list-item-title { font-size: 16px; font-weight: 500; }
+        .list-item-desc { font-size: 12px; color: var(--text-secondary); }
+        .switch {
+            width: 50px; height: 30px; background: rgba(120, 120, 128, 0.32); border-radius: 15px;
+            position: relative; cursor: pointer; transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .switch.active { background: var(--success); }
+        .switch::after {
+            content: ''; position: absolute; top: 2px; left: 2px; width: 26px; height: 26px;
+            background: #FFF; border-radius: 50%; box-shadow: 0 3px 8px rgba(0,0,0,0.15), 0 1px 1px rgba(0,0,0,0.16);
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .switch.active::after { transform: translateX(20px); }
+        .btn {
+            width: 100%; padding: 16px; background: var(--accent); color: white; border: none;
+            border-radius: 16px; font-size: 17px; font-weight: 600; cursor: pointer;
+            transition: transform 0.1s, background 0.2s; display: flex; justify-content: center; align-items: center; gap: 8px;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn-secondary { background: var(--input-bg); color: var(--accent); }
+        .checkbox-group { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; }
+        .checkbox-item { display: flex; align-items: center; gap: 8px; font-size: 15px; cursor: pointer; }
+        .checkbox-item input { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+        .client-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-top: 12px; }
+        .client-btn {
+            padding: 12px 10px; background: var(--input-bg); color: var(--accent); border: 1px solid transparent;
+            border-radius: 12px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; text-align: center;
+        }
+        .client-btn:active { transform: scale(0.95); background: var(--accent); color: #fff; }
+        .result-box {
+            margin-top: 16px; padding: 16px; background: var(--input-bg); border-radius: 14px;
+            font-size: 13px; word-break: break-all; display: none; line-height: 1.5;
+            max-height: 250px; overflow-y: auto; border: 1px solid var(--border-color);
+        }
+        #protocolSection { transition: opacity 0.3s ease; }
+        .disabled-section { opacity: 0.4; pointer-events: none; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h2>节点生成与地址混合工具</h2>
+            <h1>智能节点中心</h1>
+            <p>生成、优选、混合转换一站式管理</p>
         </div>
         
         <div class="card">
+            <h3 class="card-title">🌐 基础鉴权</h3>
             <div class="form-group">
-                <label>域名 (生成模式必填)</label>
-                <input type="text" id="domain" placeholder="请输入您的域名">
+                <label>域名 (Domain)</label>
+                <input type="text" id="domain" placeholder="example.workers.dev">
             </div>
             <div class="form-group">
-                <label>UUID/Password (生成模式必填)</label>
-                <input type="text" id="uuid" placeholder="请输入UUID或Password">
+                <label>UUID / Password</label>
+                <input type="text" id="uuid" placeholder="xxxx-xxxx-xxxx-xxxx">
             </div>
-            
-            <hr style="border: 0.5px solid #eee; margin: 20px 0;">
-            
-            <div class="form-group" style="background: #f9f9f9; padding: 15px; border-radius: 8px; border: 1px dashed #ccc;">
-                <label style="color: #007AFF;">★ 外部节点源导入 (可选，填入后将进入替换模式)</label>
-                <input type="text" id="importSubUrl" placeholder="输入节点订阅链接 URL" oninput="checkImportMode()">
-                <textarea id="importNodes" placeholder="或手动输入vless/vmess/trojan链接，多条请换行" style="margin-top:10px; height:60px;" oninput="checkImportMode()"></textarea>
-                <button type="button" class="btn" style="background: #34C759;" onclick="previewNodes()">预览解析节点</button>
-                <div id="parsedNodesPreview" class="result-box"></div>
+        </div>
+        
+        <div class="card" style="border: 1.5px dashed var(--accent);">
+            <h3 class="card-title" style="color: var(--accent);">🔄 外部节点源导入 (可选)</h3>
+            <p style="font-size: 13px; color: var(--text-secondary); margin-top:-10px; margin-bottom:15px;">填入内容后自动进入<b>混合替换模式</b>，仅替换下方收集到的优选IP/域名。</p>
+            <div class="form-group">
+                <label>订阅链接 URL</label>
+                <input type="text" id="importSubUrl" placeholder="https://" oninput="checkImportMode()">
             </div>
+            <div class="form-group">
+                <label>手动填入节点 (多条换行)</label>
+                <textarea id="importNodes" placeholder="vless://..." oninput="checkImportMode()"></textarea>
+            </div>
+            <button type="button" class="btn btn-secondary" onclick="previewNodes()">预览解析节点配置</button>
+            <div id="parsedNodesPreview" class="result-box"></div>
+        </div>
 
-            <hr style="border: 0.5px solid #eee; margin: 20px 0;">
-
+        <div class="card">
+            <h3 class="card-title">⚡️ 优选与提取控制</h3>
             <div class="list-item" onclick="toggleSwitch('switchDomain')">
-                <span>启用默认优选域名</span><div class="switch active" id="switchDomain"></div>
+                <div class="list-item-text">
+                    <span class="list-item-title">默认优选域名</span>
+                    <span class="list-item-desc">启用内置的高速反代域名列表</span>
+                </div>
+                <div class="switch active" id="switchDomain"></div>
             </div>
-            <div class="form-group">
-                <label>自定义优选域名URL (多条请换行)</label>
-                <textarea id="customDomainUrls" placeholder="http://..." style="height: 50px;"></textarea>
+            <div class="form-group" style="margin-top: 12px;">
+                <label>自定义域名 URL (支持多行)</label>
+                <textarea id="customDomainUrls" placeholder="从该 URL 提取额外优选域名"></textarea>
             </div>
             
             <div class="list-item" onclick="toggleSwitch('switchIP')">
-                <span>启用默认优选IP</span><div class="switch active" id="switchIP"></div>
+                <div class="list-item-text">
+                    <span class="list-item-title">默认优选 IP</span>
+                    <span class="list-item-desc">启用内置实时优选 IPv4/IPv6</span>
+                </div>
+                <div class="switch active" id="switchIP"></div>
             </div>
             <div class="list-item" onclick="toggleSwitch('switchGitHub')">
-                <span>启用GitHub及API优选IP</span><div class="switch active" id="switchGitHub"></div>
+                <div class="list-item-text">
+                    <span class="list-item-title">第三方接口优选 IP</span>
+                    <span class="list-item-desc">启用 GitHub 或自建测速源提取</span>
+                </div>
+                <div class="switch active" id="switchGitHub"></div>
             </div>
+            <div class="form-group" style="margin-top: 12px;">
+                <label>自定义 IP 源 URL (最多提取30个)</label>
+                <textarea id="customIpUrls" placeholder="https://..."></textarea>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="card-title">⚙️ 全局参数筛选</h3>
             <div class="form-group">
-                <label>自定义多组优选IP URL (多条请换行，最多提取30个)</label>
-                <textarea id="customIpUrls" placeholder="http://..." style="height: 50px;"></textarea>
-            </div>
-
-            <div class="form-group">
-                <label>IP版本及运营商选择 (全局共享)</label>
+                <label>IP 版本允许</label>
                 <div class="checkbox-group">
-                    <label><input type="checkbox" id="ipv4Enabled" checked> IPv4</label>
-                    <label><input type="checkbox" id="ipv6Enabled" checked> IPv6</label>
-                </div>
-                <div class="checkbox-group">
-                    <label><input type="checkbox" id="ispMobile" checked> 移动</label>
-                    <label><input type="checkbox" id="ispUnicom" checked> 联通</label>
-                    <label><input type="checkbox" id="ispTelecom" checked> 电信</label>
+                    <label class="checkbox-item"><input type="checkbox" id="ipv4Enabled" checked> IPv4</label>
+                    <label class="checkbox-item"><input type="checkbox" id="ipv6Enabled" checked> IPv6</label>
                 </div>
             </div>
-
-            <div id="protocolSection">
-                <div class="form-group">
-                    <label>协议选择 (生成模式可用)</label>
-                    <div class="list-item" onclick="toggleSwitch('switchVL')"><span>VLESS</span><div class="switch active" id="switchVL"></div></div>
-                    <div class="list-item" onclick="toggleSwitch('switchTJ')"><span>Trojan</span><div class="switch" id="switchTJ"></div></div>
-                    <div class="list-item" onclick="toggleSwitch('switchVM')"><span>VMess</span><div class="switch" id="switchVM"></div></div>
-                </div>
-                <div class="list-item" onclick="toggleSwitch('switchECH')">
-                    <span>ECH 节点生成</span><div class="switch" id="switchECH"></div>
-                </div>
-            </div>
-            
-            <div class="list-item" onclick="toggleSwitch('switchTLS')">
-                <span>仅筛选/生成 TLS 节点 (全局共享)</span><div class="switch" id="switchTLS"></div>
-            </div>
-
             <div class="form-group" style="margin-top: 20px;">
-                <label>生成订阅链接</label>
-                <div class="client-grid">
-                    <button class="client-btn" onclick="generateClientLink('v2ray', '通用格式')">通用 V2RAY</button>
-                    <button class="client-btn" onclick="generateClientLink('clash', 'CLASH')">CLASH</button>
-                    <button class="client-btn" onclick="generateClientLink('surge', 'SURGE')">SURGE</button>
+                <label>运营商放行 (国内优化)</label>
+                <div class="checkbox-group">
+                    <label class="checkbox-item"><input type="checkbox" id="ispMobile" checked> 中国移动</label>
+                    <label class="checkbox-item"><input type="checkbox" id="ispUnicom" checked> 中国联通</label>
+                    <label class="checkbox-item"><input type="checkbox" id="ispTelecom" checked> 中国电信</label>
                 </div>
-                <div class="result-box" id="finalSubUrl" style="background: #e5f1ff; color: #007aff;"></div>
             </div>
+            <div class="list-item" style="margin-top: 10px;" onclick="toggleSwitch('switchTLS')">
+                <div class="list-item-text">
+                    <span class="list-item-title">仅强制 TLS 节点</span>
+                    <span class="list-item-desc">自动过滤/关闭 80 端口等非加密节点</span>
+                </div>
+                <div class="switch" id="switchTLS"></div>
+            </div>
+        </div>
+
+        <div class="card" id="protocolSection">
+            <h3 class="card-title">🔑 协议类型 (生成模式)</h3>
+            <div class="list-item" onclick="toggleSwitch('switchVL')">
+                <span class="list-item-title">VLESS (WS)</span><div class="switch active" id="switchVL"></div>
+            </div>
+            <div class="list-item" onclick="toggleSwitch('switchTJ')">
+                <span class="list-item-title">Trojan (WS)</span><div class="switch" id="switchTJ"></div>
+            </div>
+            <div class="list-item" onclick="toggleSwitch('switchVM')">
+                <span class="list-item-title">VMess (WS)</span><div class="switch" id="switchVM"></div>
+            </div>
+            <div class="list-item" onclick="toggleSwitch('switchECH')">
+                <span class="list-item-title">开启 ECH 参数</span><div class="switch" id="switchECH"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="card-title">🚀 订阅下发</h3>
+            <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 15px;">自适应链接可直接粘贴至任何主流客户端，服务端将自动侦测设备 (User-Agent) 下发匹配格式。</p>
+            <button class="btn" style="background: var(--success);" onclick="generateClientLink('auto', '全协议自适应 (Auto)')">✨ 一键全协议自适应订阅</button>
+            
+            <p style="font-size: 13px; color: var(--text-secondary); margin-top: 25px; margin-bottom: 8px;">单独指定客户端专属订阅（调用外部转换及原生Base64）：</p>
+            <div class="client-grid">
+                <button class="client-btn" onclick="generateClientLink('v2ray', '通用V2RAY')">通用V2RAY</button>
+                <button class="client-btn" onclick="generateClientLink('v2ray', 'NEKORAY')">NEKORAY</button>
+                <button class="client-btn" onclick="generateClientLink('v2ray', 'Shadowrocket')">Shadowrocket</button>
+                <button class="client-btn" onclick="generateClientLink('clash', 'CLASH')">CLASH</button>
+                <button class="client-btn" onclick="generateClientLink('surge', 'SURGE')">SURGE</button>
+                <button class="client-btn" onclick="generateClientLink('quanx', 'QUANTUMULT X')">QUANTUMULT X</button>
+            </div>
+            <div class="result-box" id="finalSubUrl" style="background: rgba(0, 122, 255, 0.1); color: var(--accent); border-color: rgba(0,122,255,0.2);"></div>
         </div>
     </div>
     
     <script>
+        const SUB_CONVERTER_URL = "${scuValue}";
+
         let switches = { switchDomain: true, switchIP: true, switchGitHub: true, switchVL: true, switchTJ: false, switchVM: false, switchTLS: false, switchECH: false };
         
         function toggleSwitch(id) {
             const el = document.getElementById(id);
-            if (el.classList.contains('disabled')) return;
+            if (el.closest('.disabled-section')) return;
             switches[id] = !switches[id];
             el.classList.toggle('active');
         }
 
-        // 监听导入状态，禁用协议选择
         function checkImportMode() {
             const hasImport = document.getElementById('importSubUrl').value.trim() || document.getElementById('importNodes').value.trim();
             const section = document.getElementById('protocolSection');
-            if (hasImport) {
-                section.style.opacity = '0.5';
-                section.style.pointerEvents = 'none';
-            } else {
-                section.style.opacity = '1';
-                section.style.pointerEvents = 'auto';
-            }
+            if (hasImport) section.classList.add('disabled-section');
+            else section.classList.remove('disabled-section');
         }
 
-        // 预览节点：向后端发送请求解析
         async function previewNodes() {
             const importSubUrl = document.getElementById('importSubUrl').value.trim();
             const importNodes = document.getElementById('importNodes').value.trim();
             const previewBox = document.getElementById('parsedNodesPreview');
-            
-            if (!importSubUrl && !importNodes) {
-                alert('请先输入订阅URL或节点内容');
-                return;
-            }
+            if (!importSubUrl && !importNodes) { alert('请先输入订阅URL或节点内容'); return; }
 
             previewBox.style.display = 'block';
-            previewBox.innerHTML = '正在解析，请稍候...';
-
+            previewBox.innerHTML = '<span style="color:var(--accent)">正在解析，请稍候...</span>';
             try {
                 const response = await fetch('/parse-nodes', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: importSubUrl, text: importNodes })
                 });
                 const data = await response.json();
-                
                 if (data.nodes && data.nodes.length > 0) {
                     previewBox.innerHTML = '<strong>成功解析 ' + data.nodes.length + ' 个节点:</strong><br><br>' + 
-                        data.nodes.map(n => n.substring(0, 80) + '...').join('<br><br>');
+                        data.nodes.map(n => n.substring(0, 90) + '...').join('<br><br>');
                 } else {
-                    previewBox.innerHTML = '未解析出有效节点，请检查格式。';
+                    previewBox.innerHTML = '<span style="color:var(--danger)">未解析出有效节点，请检查格式或链接连通性。</span>';
                 }
             } catch (e) {
-                previewBox.innerHTML = '解析请求失败: ' + e.message;
+                previewBox.innerHTML = '<span style="color:var(--danger)">解析请求失败: ' + e.message + '</span>';
             }
         }
 
         function generateClientLink(clientType, clientName) {
             const domain = document.getElementById('domain').value.trim();
             const uuid = document.getElementById('uuid').value.trim();
-            
             const hasImport = document.getElementById('importSubUrl').value.trim() || document.getElementById('importNodes').value.trim();
             
             if (!hasImport && (!domain || !uuid)) {
-                alert('生成模式下，请先填写域名和UUID/Password');
+                alert('生成模式下，请先补全基础鉴权信息 (域名和UUID)');
+                document.getElementById('domain').focus();
                 return;
             }
             
-            // 构造参数配置对象
             const config = {
-                domain: domain,
-                uuid: uuid,
-                epd: switches.switchDomain,
-                epi: switches.switchIP,
-                egi: switches.switchGitHub,
+                domain: domain, uuid: uuid,
+                epd: switches.switchDomain, epi: switches.switchIP, egi: switches.switchGitHub,
                 evEnabled: switches.switchVL,
                 ipv4: document.getElementById('ipv4Enabled').checked,
                 ipv6: document.getElementById('ipv6Enabled').checked,
                 ispMobile: document.getElementById('ispMobile').checked,
                 ispUnicom: document.getElementById('ispUnicom').checked,
                 ispTelecom: document.getElementById('ispTelecom').checked,
-                disableNonTLS: switches.switchTLS,
-                echEnabled: switches.switchECH,
-                
+                disableNonTLS: switches.switchTLS, echEnabled: switches.switchECH,
                 customDomainUrls: document.getElementById('customDomainUrls').value.trim(),
                 customIpUrls: document.getElementById('customIpUrls').value.trim(),
                 importSubUrl: document.getElementById('importSubUrl').value.trim(),
                 importNodesText: document.getElementById('importNodes').value.trim()
             };
 
-            // 利用 Base64 编码复杂对象作为单参数传递给后端
             const configB64 = btoa(unescape(encodeURIComponent(JSON.stringify(config))));
             const baseUrl = new URL(window.location.href).origin;
-            let finalUrl = \`\${baseUrl}/sub?config=\${configB64}&target=\${clientType}\`;
+            
+            let finalUrl = '';
+            
+            // 路由不同的请求机制
+            if (clientType === 'auto') {
+                // 自适应链接
+                finalUrl = \`\${baseUrl}/sub?config=\${configB64}&target=auto\`;
+            } else if (clientType === 'v2ray') {
+                // 原生 Base64，给 V2Ray, Shadowrocket, Nekoray 使用
+                finalUrl = \`\${baseUrl}/sub?config=\${configB64}&target=base64\`;
+            } else {
+                // 调用外部转换器，给 Clash, Surge, QuanX 使用
+                const sourceBase64Url = \`\${baseUrl}/sub?config=\${configB64}&target=base64\`;
+                finalUrl = SUB_CONVERTER_URL + '?target=' + clientType + '&url=' + encodeURIComponent(sourceBase64Url) + '&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true';
+            }
 
-            // 展示链接
             const urlElement = document.getElementById('finalSubUrl');
-            urlElement.textContent = finalUrl;
+            urlElement.innerHTML = \`<strong>[\${clientName}] 订阅链接生成成功：</strong><br><br>\${finalUrl}\`;
             urlElement.style.display = 'block';
             
             navigator.clipboard.writeText(finalUrl).then(() => {
-                alert(clientName + ' 订阅链接已复制');
+                let originalText = urlElement.innerHTML;
+                urlElement.innerHTML = '<span style="color: var(--success); font-weight: bold;">✓ 链接已复制到剪贴板！可以直接去客户端粘贴使用了。</span>';
+                setTimeout(() => { urlElement.innerHTML = originalText; }, 2500);
             });
         }
     </script>
@@ -708,44 +776,29 @@ export default {
         const url = new URL(request.url);
         const path = url.pathname;
         
-        // 主页
         if (path === '/' || path === '') {
-            return new Response(generateHomePage(env?.scu || scu), {
-                headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            });
+            return new Response(generateHomePage(env?.scu || scu), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
         
-        // 解析节点API接口 (前端调用)
         if (path === '/parse-nodes' && request.method === 'POST') {
             try {
                 const body = await request.json();
                 let nodes = [];
-                if (body.url) {
-                    const resp = await fetch(body.url);
-                    const text = await resp.text();
-                    nodes = nodes.concat(await parseImportedNodesContent(text));
-                }
-                if (body.text) {
-                    nodes = nodes.concat(await parseImportedNodesContent(body.text));
-                }
-                return new Response(JSON.stringify({ success: true, nodes: nodes }), {
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                if (body.url) nodes = nodes.concat(await parseImportedNodesContent(await (await fetch(body.url)).text()));
+                if (body.text) nodes = nodes.concat(await parseImportedNodesContent(body.text));
+                return new Response(JSON.stringify({ success: true, nodes: nodes }), { headers: { 'Content-Type': 'application/json' } });
             } catch(e) {
                 return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500 });
             }
         }
         
-        // 订阅生成接口: /sub?config=base64...
         if (path.endsWith('/sub')) {
             const configStr = url.searchParams.get('config');
             if (configStr) {
                 try {
                     const configs = JSON.parse(decodeURIComponent(escape(atob(configStr))));
-                    // 处理可能多行的URL输入
                     configs.customDomainUrls = extractUrls(configs.customDomainUrls);
                     configs.customIpUrls = extractUrls(configs.customIpUrls);
-                    
                     return await handleSubscriptionRequest(request, configs.uuid || 'user', configs.domain, configs);
                 } catch(e) {
                     return new Response('Config decode error: ' + e.message, { status: 400 });
